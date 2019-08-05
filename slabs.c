@@ -8,6 +8,7 @@
  * memcached protocol.
  */
 #include "memcached.h"
+#include "slabs.h"
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -25,22 +26,8 @@
 //#define DEBUG_SLAB_MOVER
 /* powers-of-N allocation structures */
 
-typedef struct {
-    unsigned int size;      /* sizes of items */
-    unsigned int perslab;   /* how many items per slab */
-
-    void *slots;           /* list of item ptrs */
-    unsigned int sl_curr;   /* total free items in list */
-
-    unsigned int slabs;     /* how many slabs were allocated for this class */
-
-    void **slab_list;       /* array of slab pointers */
-    unsigned int list_size; /* size of prev array */
-
-    size_t requested; /* The number of requested bytes */
-} slabclass_t;
-
 static slabclass_t slabclass[MAX_NUMBER_OF_SLAB_CLASSES];
+// slabclass_t slabclass[MAX_NUMBER_OF_SLAB_CLASSES];
 static size_t mem_limit = 0;
 static size_t mem_malloced = 0;
 /* If the memory limit has been hit once. Used as a hint to decide when to
@@ -97,6 +84,15 @@ unsigned int slabs_clsid(const size_t size) {
         if (res++ == power_largest)     /* won't fit in the biggest slab */
             return power_largest;
     return res;
+}
+
+int slabs_size(int clsid){
+    int item_size = slabclass[clsid].size;
+    return item_size;
+}
+
+slabclass_t *get_slab(int clsid){
+    return &slabclass[clsid];
 }
 
 #if defined(__linux__) && defined(MADV_HUGEPAGE)
@@ -207,6 +203,10 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc, co
             fprintf(stderr, "slab class %3d: chunk size %9u perslab %7u\n",
                     i, slabclass[i].size, slabclass[i].perslab);
         }
+
+        /* init head and tail of alloc list */
+        slabclass[i].alloc_head = NULL;
+        slabclass[i].alloc_tail = NULL;
     }
 
     power_largest = i;
@@ -355,6 +355,7 @@ static void *do_slabs_alloc(const size_t size, unsigned int id, uint64_t *total_
     }
 
     if (p->sl_curr != 0) {
+        /* return an item from freelist */
         /* return off our freelist */
         it = (item *)p->slots;
         p->slots = it->next;
@@ -364,6 +365,19 @@ static void *do_slabs_alloc(const size_t size, unsigned int id, uint64_t *total_
         it->it_flags &= ~ITEM_SLABBED;
         it->refcount = 1;
         p->sl_curr--;
+        
+        it->next = NULL;
+        it->prev = NULL;
+
+        /* add this item to alloclist */
+        // if(p->alloc_head){
+        //     it->next = (item *)p->alloc_head;
+        //     it->next->prev = it;
+        // }
+        // p->alloc_head = it;
+        // if(p->alloc_tail == NULL)
+        //     p->alloc_tail = it;
+
         ret = (void *)it;
     } else {
         ret = NULL;
@@ -438,6 +452,32 @@ static void do_slabs_free_chunked(item *it, const size_t size) {
     return;
 }
 
+void link_slab_LRU(item *it){
+    int clsid = it->slabs_clsid;
+    slabclass_t *p = &slabclass[clsid];
+
+    if(p->alloc_head){
+        it->next = (item *)p->alloc_head;
+        it->next->prev = it;
+    }
+    p->alloc_head = it;
+    if(p->alloc_tail == NULL)
+        p->alloc_tail = it;
+}
+
+void unlink_slab_LRU(item *it){
+    int clsid = it->slabs_clsid;
+    slabclass_t *p = &slabclass[clsid];
+
+    if(it->next)
+        it->next->prev = it->prev;
+    if(it->prev)
+        it->prev->next = it->next;
+    if(p->alloc_head == it)
+        p->alloc_head = it->next;
+    if(p->alloc_tail == it)
+        p->alloc_tail = it->prev;
+}
 
 static void do_slabs_free(void *ptr, const size_t size, unsigned int id) {
     slabclass_t *p;
@@ -455,6 +495,17 @@ static void do_slabs_free(void *ptr, const size_t size, unsigned int id) {
 #ifdef EXTSTORE
         bool is_hdr = it->it_flags & ITEM_HDR;
 #endif
+        /* unlink from alloclist*/
+        // if(it->next)
+        //     it->next->prev = it->prev;
+        // if(it->prev)
+        //     it->prev->next = it->next;
+        // if(p->alloc_head == it)
+        //     p->alloc_head = it->next;
+        // if(p->alloc_tail == it)
+        //     p->alloc_tail = it->prev;
+
+        /* add to freelist */
         it->it_flags = ITEM_SLABBED;
         it->slabs_clsid = 0;
         it->prev = 0;
@@ -939,7 +990,7 @@ static int slab_rebalance_move(void) {
                             // can't drop to 0 until we release item lock.
                             STORAGE_delete(storage, it);
                             pthread_mutex_unlock(&slabs_lock);
-                            do_item_unlink(it, hv);
+                            // do_item_unlink(it, hv);
                             pthread_mutex_lock(&slabs_lock);
                         }
                         status = MOVE_BUSY;
@@ -1018,7 +1069,7 @@ static int slab_rebalance_move(void) {
                         /* These are definitely required. else fails assert */
                         new_it->it_flags &= ~ITEM_LINKED;
                         new_it->refcount = 0;
-                        do_item_replace(it, new_it, hv);
+                        // do_item_replace(it, new_it, hv);
                         /* Need to walk the chunks and repoint head  */
                         if (new_it->it_flags & ITEM_CHUNKED) {
                             item_chunk *fch = (item_chunk *) ITEM_schunk(new_it);
@@ -1055,7 +1106,7 @@ static int slab_rebalance_move(void) {
                     /* restore ntotal in case we tried saving a head chunk. */
                     ntotal = ITEM_ntotal(it);
                     STORAGE_delete(storage, it);
-                    do_item_unlink(it, hv);
+                    // do_item_unlink(it, hv);
                     slabs_free(it, ntotal, slab_rebal.s_clsid);
                     /* Swing around again later to remove it from the freelist. */
                     slab_rebal.busy_items++;

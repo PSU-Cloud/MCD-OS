@@ -142,6 +142,9 @@ struct settings settings;
 time_t process_started;     /* when the process was started */
 conn **conns;
 
+/* hash table key->proxies, declared in hashtable.c */
+extern struct element *my_hash_table;  
+
 struct slab_rebalance slab_rebal;
 volatile int slab_rebalance_signal;
 #ifdef EXTSTORE
@@ -718,7 +721,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
                 break;
         }
     }
-
+    
     event_set(&c->event, sfd, event_flags, event_handler, (void *)c);
     event_base_set(base, &c->event);
     c->ev_flags = event_flags;
@@ -757,7 +760,7 @@ static void recache_or_free(conn *c, io_wrap *wrap) {
         // If request was ultimately a miss, unlink the header.
         do_free = false;
         size_t ntotal = ITEM_ntotal(wrap->hdr_it);
-        item_unlink(wrap->hdr_it);
+        item_unlink(wrap->hdr_it, c->thread);
         slabs_free(it, ntotal, slabs_clsid(ntotal));
         pthread_mutex_lock(&c->thread->stats.mutex);
         c->thread->stats.miss_from_extstore++;
@@ -783,7 +786,7 @@ static void recache_or_free(conn *c, io_wrap *wrap) {
                 it->refcount = 0;
                 it->h_next = NULL; // might not be necessary.
                 STORAGE_delete(c->thread->storage, h_it);
-                item_replace(h_it, it, hv);
+                item_replace(h_it, it, c->thread, hv);
                 pthread_mutex_lock(&c->thread->stats.mutex);
                 c->thread->stats.recache_from_extstore++;
                 pthread_mutex_unlock(&c->thread->stats.mutex);
@@ -1263,8 +1266,16 @@ static void complete_nread_ascii(conn *c) {
     enum store_item_type ret;
     bool is_valid = false;
 
+    /*-------------------*/
+    // LIBEVENT_THREAD *thread = c->thread
+    // int thread_id = thread->id;
+    // int cur_lru = it->lru[thread_id];
+    // int id = thread->id * NUM_SUB_LRU_LISTS + cur_lru;
+    // /*-------------------*/
+
     pthread_mutex_lock(&c->thread->stats.mutex);
-    c->thread->stats.slab_stats[ITEM_clsid(it)].set_cmds++;
+    // c->thread->stats.slab_stats[ITEM_clsid(it)].set_cmds++;
+    c->thread->stats.slab_stats[it->slabs_clsid].set_cmds++;  // it's slabclass id
     pthread_mutex_unlock(&c->thread->stats.mutex);
 
     if ((it->it_flags & ITEM_CHUNKED) == 0) {
@@ -1351,6 +1362,9 @@ static void complete_nread_ascii(conn *c) {
 
     item_remove(c->item);       /* release the c->item reference */
     c->item = 0;
+
+    pthread_mutex_unlock(&global_lock);
+    //printf("release global lock\n");
 }
 
 /**
@@ -1558,7 +1572,7 @@ static void complete_incr_bin(conn *c) {
                 (unsigned long long)req->message.body.initial);
             int res = strlen(tmpbuf);
             it = item_alloc(key, nkey, 0, realtime(req->message.body.expiration),
-                            res + 2);
+                            res + 2, c->thread);
 
             if (it != NULL) {
                 memcpy(ITEM_data(it), tmpbuf, res);
@@ -1729,10 +1743,13 @@ static void process_bin_get_or_touch(conn *c) {
         pthread_mutex_lock(&c->thread->stats.mutex);
         if (should_touch) {
             c->thread->stats.touch_cmds++;
-            c->thread->stats.slab_stats[ITEM_clsid(it)].touch_hits++;
+            // c->thread->stats.slab_stats[ITEM_clsid(it)].touch_hits++;
+            c->thread->stats.slab_stats[it->slabs_clsid].touch_hits++;
         } else {
             c->thread->stats.get_cmds++;
-            c->thread->stats.lru_hits[it->slabs_clsid]++;
+            // c->thread->stats.lru_hits[it->slabs_clsid]++;
+            int id = c->thread->id * NUM_SUB_LRU_LISTS + it->lru[c->thread->id];
+            c->thread->stats.lru_hits[id]++;
         }
         pthread_mutex_unlock(&c->thread->stats.mutex);
 
@@ -2163,7 +2180,7 @@ static void process_bin_sasl_auth(conn *c) {
     char *key = binary_get_key(c);
     assert(key);
 
-    item *it = item_alloc(key, nkey, 0, 0, vlen+2);
+    item *it = item_alloc(key, nkey, 0, 0, vlen+2, c->thread);
 
     /* Can't use a chunked item for SASL authentication. */
     if (it == 0 || (it->it_flags & ITEM_CHUNKED)) {
@@ -2193,7 +2210,7 @@ static void process_bin_complete_sasl_auth(conn *c) {
     if (nkey > ((item*) c->item)->nkey) {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_EINVAL, NULL, vlen);
         c->write_and_go = conn_swallow;
-        item_unlink(c->item);
+        item_unlink(c->item, c->thread);
         return;
     }
 
@@ -2209,7 +2226,7 @@ static void process_bin_complete_sasl_auth(conn *c) {
     if (vlen > ((item*) c->item)->nbytes) {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_EINVAL, NULL, vlen);
         c->write_and_go = conn_swallow;
-        item_unlink(c->item);
+        item_unlink(c->item, c->thread);
         return;
     }
 
@@ -2245,7 +2262,7 @@ static void process_bin_complete_sasl_auth(conn *c) {
         break;
     }
 
-    item_unlink(c->item);
+    item_unlink(c->item, c->thread);
 
     if (settings.verbose) {
         fprintf(stderr, "sasl result code:  %d\n", result);
@@ -2533,7 +2550,7 @@ static void process_bin_update(conn *c) {
     }
 
     it = item_alloc(key, nkey, req->message.body.flags,
-            realtime(req->message.body.expiration), vlen+2);
+            realtime(req->message.body.expiration), vlen+2, c->thread);
 
     if (it == 0) {
         enum store_item_type status;
@@ -2547,16 +2564,20 @@ static void process_bin_update(conn *c) {
             status = NO_MEMORY;
         }
         /* FIXME: losing c->cmd since it's translated below. refactor? */
+        // LOGGER_LOG(c->thread->l, LOG_MUTATIONS, LOGGER_ITEM_STORE,
+        //         NULL, status, 0, key, nkey, req->message.body.expiration,
+        //         ITEM_clsid(it));
         LOGGER_LOG(c->thread->l, LOG_MUTATIONS, LOGGER_ITEM_STORE,
                 NULL, status, 0, key, nkey, req->message.body.expiration,
-                ITEM_clsid(it));
+                it->slabs_clsid);
 
         /* Avoid stale data persisting in cache because we failed alloc.
          * Unacceptable for SET. Anywhere else too? */
         if (c->cmd == PROTOCOL_BINARY_CMD_SET) {
             it = item_get(key, nkey, c, DONT_UPDATE);
             if (it) {
-                item_unlink(it);
+                // item_unlink(it, c->thread->id);
+                item_unlink_inall(it);
                 STORAGE_delete(c->thread->storage, it);
                 item_remove(it);
             }
@@ -2622,7 +2643,7 @@ static void process_bin_append_prepend(conn *c) {
         stats_prefix_record_set(key, nkey);
     }
 
-    it = item_alloc(key, nkey, 0, 0, vlen+2);
+    it = item_alloc(key, nkey, 0, 0, vlen+2, c->thread);
 
     if (it == 0) {
         if (! item_size_ok(nkey, 0, vlen + 2)) {
@@ -2730,15 +2751,16 @@ static void process_bin_delete(conn *c) {
         if (cas == 0 || cas == ITEM_get_cas(it)) {
             MEMCACHED_COMMAND_DELETE(c->sfd, ITEM_key(it), it->nkey);
             pthread_mutex_lock(&c->thread->stats.mutex);
-            c->thread->stats.slab_stats[ITEM_clsid(it)].delete_hits++;
+            // c->thread->stats.slab_stats[ITEM_clsid(it)].delete_hits++;
+            c->thread->stats.slab_stats[it->slabs_clsid].delete_hits++;
             pthread_mutex_unlock(&c->thread->stats.mutex);
-            do_item_unlink(it, hv);
-            STORAGE_delete(c->thread->storage, it);
+            do_item_unlink(it, c->thread, hv, true);
+            // STORAGE_delete(c->thread->storage, it);
             write_bin_response(c, NULL, 0, 0, 0);
         } else {
             write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_EEXISTS, NULL, 0);
         }
-        do_item_remove(it);      /* release our reference */
+        // do_item_remove(it);      /* release our reference */ // will be removed in item_unlink
     } else {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_ENOENT, NULL, 0);
         pthread_mutex_lock(&c->thread->stats.mutex);
@@ -2821,7 +2843,8 @@ static void complete_nread(conn *c) {
 
 /* Destination must always be chunked */
 /* This should be part of item.c */
-static int _store_item_copy_chunks(item *d_it, item *s_it, const int len) {
+// static int _store_item_copy_chunks(item *d_it, item *s_it, const int len) {
+static int _store_item_copy_chunks(item *d_it, item *s_it, const int len, LIBEVENT_THREAD *thread) {
     item_chunk *dch = (item_chunk *) ITEM_schunk(d_it);
     /* Advance dch until we find free space */
     while (dch->size == dch->used) {
@@ -2851,7 +2874,7 @@ static int _store_item_copy_chunks(item *d_it, item *s_it, const int len) {
             remain -= todo;
             assert(dch->used <= dch->size);
             if (dch->size == dch->used) {
-                item_chunk *tch = do_item_alloc_chunk(dch, remain);
+                item_chunk *tch = do_item_alloc_chunk(dch, remain, thread);
                 if (tch) {
                     dch = tch;
                 } else {
@@ -2878,7 +2901,7 @@ static int _store_item_copy_chunks(item *d_it, item *s_it, const int len) {
             dch->used += todo;
             assert(dch->used <= dch->size);
             if (dch->size == dch->used) {
-                item_chunk *tch = do_item_alloc_chunk(dch, len - done);
+                item_chunk *tch = do_item_alloc_chunk(dch, len - done, thread);
                 if (tch) {
                     dch = tch;
                 } else {
@@ -2891,11 +2914,11 @@ static int _store_item_copy_chunks(item *d_it, item *s_it, const int len) {
     return 0;
 }
 
-static int _store_item_copy_data(int comm, item *old_it, item *new_it, item *add_it) {
+static int _store_item_copy_data(int comm, item *old_it, item *new_it, item *add_it, LIBEVENT_THREAD *thread) {
     if (comm == NREAD_APPEND) {
         if (new_it->it_flags & ITEM_CHUNKED) {
-            if (_store_item_copy_chunks(new_it, old_it, old_it->nbytes - 2) == -1 ||
-                _store_item_copy_chunks(new_it, add_it, add_it->nbytes) == -1) {
+            if (_store_item_copy_chunks(new_it, old_it, old_it->nbytes - 2, thread) == -1 ||
+                _store_item_copy_chunks(new_it, add_it, add_it->nbytes, thread) == -1) {
                 return -1;
             }
         } else {
@@ -2905,8 +2928,8 @@ static int _store_item_copy_data(int comm, item *old_it, item *new_it, item *add
     } else {
         /* NREAD_PREPEND */
         if (new_it->it_flags & ITEM_CHUNKED) {
-            if (_store_item_copy_chunks(new_it, add_it, add_it->nbytes - 2) == -1 ||
-                _store_item_copy_chunks(new_it, old_it, old_it->nbytes) == -1) {
+            if (_store_item_copy_chunks(new_it, add_it, add_it->nbytes - 2, thread) == -1 ||
+                _store_item_copy_chunks(new_it, old_it, old_it->nbytes, thread) == -1) {
                 return -1;
             }
         } else {
@@ -2914,6 +2937,12 @@ static int _store_item_copy_data(int comm, item *old_it, item *new_it, item *add
             memcpy(ITEM_data(new_it) + add_it->nbytes - 2 /* CRLF */, ITEM_data(old_it), old_it->nbytes);
         }
     }
+    // /* copy pointers in different LRU */
+    // for (int i=0; i<NUM_WORKERS; i++){
+    //     new_it->prevs[i] = old_it->prevs[i];
+    //     new_it->nexts[i] = old_it->nexts[i];
+    // }
+
     return 0;
 }
 
@@ -2924,6 +2953,10 @@ static int _store_item_copy_data(int comm, item *old_it, item *new_it, item *add
  * Returns the state of storage.
  */
 enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t hv) {
+
+    LIBEVENT_THREAD *thread = c->thread;
+    int thread_id = thread->id;
+
     char *key = ITEM_key(it);
     item *old_it = do_item_get(key, it->nkey, hv, c, DONT_UPDATE);
     enum store_item_type stored = NOT_STORED;
@@ -2933,7 +2966,7 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
 
     if (old_it != NULL && comm == NREAD_ADD) {
         /* add only adds a nonexistent item, but promote to head of LRU */
-        do_item_update(old_it);
+        do_item_update(old_it, thread);
     } else if (!old_it && (comm == NREAD_REPLACE
         || comm == NREAD_APPEND || comm == NREAD_PREPEND))
     {
@@ -2952,15 +2985,17 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
             // it and old_it may belong to different classes.
             // I'm updating the stats for the one that's getting pushed out
             pthread_mutex_lock(&c->thread->stats.mutex);
-            c->thread->stats.slab_stats[ITEM_clsid(old_it)].cas_hits++;
+            // c->thread->stats.slab_stats[ITEM_clsid(old_it)].cas_hits++;
+            c->thread->stats.slab_stats[old_it->slabs_clsid].cas_hits++;  // old_it's slabclass id
             pthread_mutex_unlock(&c->thread->stats.mutex);
 
             STORAGE_delete(c->thread->storage, old_it);
-            item_replace(old_it, it, hv);
+            item_replace(old_it, it, thread, hv);
             stored = STORED;
         } else {
             pthread_mutex_lock(&c->thread->stats.mutex);
-            c->thread->stats.slab_stats[ITEM_clsid(old_it)].cas_badval++;
+            // c->thread->stats.slab_stats[ITEM_clsid(old_it)].cas_badval++;
+            c->thread->stats.slab_stats[old_it->slabs_clsid].cas_badval++;   // old_it's slabclass id
             pthread_mutex_unlock(&c->thread->stats.mutex);
 
             if(settings.verbose > 1) {
@@ -2999,27 +3034,35 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
                 /* we have it and old_it here - alloc memory to hold both */
                 /* flags was already lost - so recover them from ITEM_suffix(it) */
                 FLAGS_CONV(old_it, flags);
-                new_it = do_item_alloc(key, it->nkey, flags, old_it->exptime, it->nbytes + old_it->nbytes - 2 /* CRLF */);
-
+                new_it = do_item_alloc(key, it->nkey, flags, old_it->exptime, it->nbytes + old_it->nbytes - 2 /* CRLF */, thread);
                 /* copy data from it and old_it to new_it */
-                if (new_it == NULL || _store_item_copy_data(comm, old_it, new_it, it) == -1) {
+                if (new_it == NULL || _store_item_copy_data(comm, old_it, new_it, it, thread) == -1) {
                     failed_alloc = 1;
                     stored = NOT_STORED;
                     // failed data copy, free up.
                     if (new_it != NULL)
                         item_remove(new_it);
                 } else {
+                    do_item_remove(it);  /* it is not linked to LRU and hashtable, just remove it*/
                     it = new_it;
+                    new_it = NULL;
+                    // do_item_unlink(old_it, thread_id, hv);    /* unlink old item */
+                    // do_item_link(it, thread_id, hv);  /* link new item to LRU */
+                    item_replace(old_it, it, thread, hv);  /* replace old by new */
+                    old_it = NULL;
                 }
             }
         }
-
+        /* relpace/set */
         if (stored == NOT_STORED && failed_alloc == 0) {
             if (old_it != NULL) {
+                //printf("current thread is %d \n", thread_id);
                 STORAGE_delete(c->thread->storage, old_it);
-                item_replace(old_it, it, hv);
+                //printf("replace item\n");
+                item_replace(old_it, it, thread, hv);
             } else {
-                do_item_link(it, hv);
+                //printf("current thread is %d \n", thread_id);
+                do_item_link(it, thread, hv, true);
             }
 
             c->cas = ITEM_get_cas(it);
@@ -3036,9 +3079,14 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
     if (stored == STORED) {
         c->cas = ITEM_get_cas(it);
     }
+    // LOGGER_LOG(c->thread->l, LOG_MUTATIONS, LOGGER_ITEM_STORE, NULL,
+    //         stored, comm, ITEM_key(it), it->nkey, it->exptime, ITEM_clsid(it));
     LOGGER_LOG(c->thread->l, LOG_MUTATIONS, LOGGER_ITEM_STORE, NULL,
-            stored, comm, ITEM_key(it), it->nkey, it->exptime, ITEM_clsid(it));
+            stored, comm, ITEM_key(it), it->nkey, it->exptime, it->slabs_clsid);
 
+    //printf("total length is %d, virtual length is %d\n", slabs_size(it->slabs_clsid), it->virtual_len);
+    //printf("thread %d, total size is %d, attribute size is %d, available size is %d\n", thread->id, thread->alloc_size, thread->attrib_size, thread->avail_size);
+    
     return stored;
 }
 
@@ -3665,6 +3713,7 @@ static inline item* limited_get(char *key, size_t nkey, conn *c, uint32_t exptim
         it = item_touch(key, nkey, exptime, c);
     } else {
         it = item_get(key, nkey, c, DO_UPDATE);
+        // fprintf(stderr, "method item_get\n");
     }
     if (it && it->refcount > IT_REFCOUNT_LIMIT) {
         item_remove(it);
@@ -3829,11 +3878,11 @@ static inline int _get_extstore(conn *c, item *it, int iovst, int iovcnt) {
         // Pull a chunked item header.
         uint32_t flags;
         FLAGS_CONV(it, flags);
-        new_it = item_alloc(ITEM_key(it), it->nkey, flags, it->exptime, it->nbytes);
+        new_it = item_alloc(ITEM_key(it), it->nkey, flags, it->exptime, it->nbytes, c->thread);
         assert(new_it == NULL || (new_it->it_flags & ITEM_CHUNKED));
         chunked = true;
     } else {
-        new_it = do_item_alloc_pull(ntotal, clsid);
+        new_it = do_item_alloc_pull(ntotal, clsid, c->thread);
     }
     if (new_it == NULL)
         return -1;
@@ -3862,9 +3911,9 @@ static inline int _get_extstore(conn *c, item *it, int iovst, int iovcnt) {
         // fill the header so we can get the full data + crc back.
         add_iov(c, new_it, ITEM_ntotal(new_it) - new_it->nbytes);
         while (remain > 0) {
-            chunk = do_item_alloc_chunk(chunk, remain);
+            chunk = do_item_alloc_chunk(chunk, remain, c->thread);
             if (chunk == NULL) {
-                item_remove(new_it);
+                item_remove(new_it, c->thread);
                 do_cache_free(c->thread->io_cache, io);
                 return -1;
             }
@@ -3937,6 +3986,9 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
     bool fail_length = false;
     assert(c != NULL);
 
+    LIBEVENT_THREAD *thread = c->thread;   /* current thread */
+    // int thread_id = thread->id;
+
     if (should_touch) {
         // For get and touch commands, use first token as exptime
         if (!safe_strtol(tokens[1].value, &exptime_int)) {
@@ -3958,11 +4010,23 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 goto stop;
             }
 
-            it = limited_get(key, nkey, c, exptime, should_touch);
+            it = limited_get(key, nkey, c, exptime, should_touch);  // do_item_get()
             if (settings.detail_enabled) {
                 stats_prefix_record_get(key, nkey, NULL != it);
             }
-            if (it) {
+            if (it) {  
+                // remove this part to do_item_get
+                //  item it is found in hashtable 
+                // if(!LRU_item(it, thread_id)){  // current LRU doesn't contain this item
+                //     item_link_LRU(it, thread_id);    // link this item to current LRU only, since it's already in hashtable
+                //     //deflation
+                //     struct counting * result = check_item(it);
+                //     deflation(it, thread, result);   
+                // }else{
+                //     do_item_update(it, thread_id);  // otherwise, update it (bump it to head)
+                // }
+                //printf("total length is %d, virtual length is %d\n", slabs_size(it->slabs_clsid), it->virtual_len);
+                //printf("thread %d, total size is %d, attribute size is %d, available size is %d\n", thread->id, thread->alloc_size, thread->attrib_size, thread->avail_size);
                 if (_ascii_get_expand_ilist(c, i) != 0) {
                     item_remove(it);
                     goto stop;
@@ -4029,9 +4093,12 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 pthread_mutex_lock(&c->thread->stats.mutex);
                 if (should_touch) {
                     c->thread->stats.touch_cmds++;
-                    c->thread->stats.slab_stats[ITEM_clsid(it)].touch_hits++;
+                    // c->thread->stats.slab_stats[ITEM_clsid(it)].touch_hits++;
+                    c->thread->stats.slab_stats[it->slabs_clsid].touch_hits++;
                 } else {
-                    c->thread->stats.lru_hits[it->slabs_clsid]++;
+                    // c->thread->stats.lru_hits[it->slabs_clsid]++;
+                    int id = thread->id * NUM_SUB_LRU_LISTS + it->lru[thread->id];
+                    c->thread->stats.lru_hits[id]++;
                     c->thread->stats.get_cmds++;
                 }
                 pthread_mutex_unlock(&c->thread->stats.mutex);
@@ -4099,6 +4166,9 @@ stop:
         conn_set_state(c, conn_mwrite);
         c->msgcurr = 0;
     }
+
+    pthread_mutex_unlock(&global_lock);
+    //printf("release global lock\n");
 }
 
 static void process_update_command(conn *c, token_t *tokens, const size_t ntokens, int comm, bool handle_cas) {
@@ -4110,6 +4180,8 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
     int vlen;
     uint64_t req_cas_id=0;
     item *it;
+    LIBEVENT_THREAD *thread = c->thread;   /* current thread */
+    // int thread_id = thread->id;
 
     assert(c != NULL);
 
@@ -4157,7 +4229,7 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
         stats_prefix_record_set(key, nkey);
     }
 
-    it = item_alloc(key, nkey, flags, realtime(exptime), vlen);
+    it = item_alloc(key, nkey, flags, realtime(exptime), vlen, thread);
 
     if (it == 0) {
         enum store_item_type status;
@@ -4179,9 +4251,10 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
         if (comm == NREAD_SET) {
             it = item_get(key, nkey, c, DONT_UPDATE);
             if (it) {
-                item_unlink(it);
+                item_unlink_inall(it);
+                // item_unlink(it, thread_id);
                 STORAGE_delete(c->thread->storage, it);
-                item_remove(it);
+                // item_remove(it);
             }
         }
 
@@ -4210,6 +4283,8 @@ static void process_touch_command(conn *c, token_t *tokens, const size_t ntokens
     int32_t exptime_int = 0;
     item *it;
 
+    // LIBEVENT_THREAD *thread = c->thread;   /* current thread */
+
     assert(c != NULL);
 
     set_noreply_maybe(c, tokens, ntokens);
@@ -4231,7 +4306,8 @@ static void process_touch_command(conn *c, token_t *tokens, const size_t ntokens
     if (it) {
         pthread_mutex_lock(&c->thread->stats.mutex);
         c->thread->stats.touch_cmds++;
-        c->thread->stats.slab_stats[ITEM_clsid(it)].touch_hits++;
+        // c->thread->stats.slab_stats[ITEM_clsid(it)].touch_hits++;
+        c->thread->stats.slab_stats[it->slabs_clsid].touch_hits++;
         pthread_mutex_unlock(&c->thread->stats.mutex);
 
         out_string(c, "TOUCHED");
@@ -4315,6 +4391,9 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
     int res;
     item *it;
 
+    LIBEVENT_THREAD *thread = c->thread;   /* current thread */
+    int thread_id = thread->id;
+
     it = do_item_get(key, nkey, hv, c, DONT_UPDATE);
     if (!it) {
         return DELTA_ITEM_NOT_FOUND;
@@ -4357,9 +4436,11 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
 
     pthread_mutex_lock(&c->thread->stats.mutex);
     if (incr) {
-        c->thread->stats.slab_stats[ITEM_clsid(it)].incr_hits++;
+        // c->thread->stats.slab_stats[ITEM_clsid(it)].incr_hits++;
+        c->thread->stats.slab_stats[it->slabs_clsid].incr_hits++;
     } else {
-        c->thread->stats.slab_stats[ITEM_clsid(it)].decr_hits++;
+        // c->thread->stats.slab_stats[ITEM_clsid(it)].decr_hits++;
+        c->thread->stats.slab_stats[it->slabs_clsid].decr_hits++;
     }
     pthread_mutex_unlock(&c->thread->stats.mutex);
 
@@ -4379,19 +4460,27 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
         item_stats_sizes_add(it);
         memcpy(ITEM_data(it), buf, res);
         memset(ITEM_data(it) + res, ' ', it->nbytes - res - 2);
-        do_item_update(it);
+        if(!LRU_item(it, thread_id)){
+            item_link_LRU(it, thread_id);   // if LRU doesn't have this item, just link it
+            //deflation
+            struct counting * result = check_item(it);
+            deflation(it, thread, result);
+        }else{
+            do_item_update(it, thread);  // otherwise, update it (bump it to head)
+        }
+        printf("virtual length is %d.\n", it->virtual_len);
     } else if (it->refcount > 1) {
         item *new_it;
         uint32_t flags;
         FLAGS_CONV(it, flags);
-        new_it = do_item_alloc(ITEM_key(it), it->nkey, flags, it->exptime, res + 2);
+        new_it = do_item_alloc(ITEM_key(it), it->nkey, flags, it->exptime, res + 2, thread);
         if (new_it == 0) {
             do_item_remove(it);
             return EOM;
         }
         memcpy(ITEM_data(new_it), buf, res);
         memcpy(ITEM_data(new_it) + res, "\r\n", 2);
-        item_replace(it, new_it, hv);
+        item_replace(it, new_it, thread, hv);
         // Overwrite the older item's CAS with our new CAS since we're
         // returning the CAS of the old item below.
         ITEM_set_cas(it, (settings.use_cas) ? ITEM_get_cas(new_it) : 0);
@@ -4419,6 +4508,8 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
     size_t nkey;
     item *it;
     uint32_t hv;
+
+    // int thread_id = c->thread->id;   /* current thread */
 
     assert(c != NULL);
 
@@ -4452,12 +4543,13 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
         MEMCACHED_COMMAND_DELETE(c->sfd, ITEM_key(it), it->nkey);
 
         pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.slab_stats[ITEM_clsid(it)].delete_hits++;
+        // c->thread->stats.slab_stats[ITEM_clsid(it)].delete_hits++;
+        c->thread->stats.slab_stats[it->slabs_clsid].delete_hits++;
         pthread_mutex_unlock(&c->thread->stats.mutex);
 
-        do_item_unlink(it, hv);
-        STORAGE_delete(c->thread->storage, it);
-        do_item_remove(it);      /* release our reference */
+        do_item_unlink(it, c->thread, hv, true);
+        // STORAGE_delete(c->thread->storage, it);
+        // do_item_remove(it);      /* release our reference */ // will be removed in item_unlink
         out_string(c, "DELETED");
     } else {
         pthread_mutex_lock(&c->thread->stats.mutex);
@@ -4720,6 +4812,8 @@ static void process_extstore_command(conn *c, token_t *tokens, const size_t ntok
 }
 #endif
 static void process_command(conn *c, char *command) {
+    pthread_mutex_lock(&global_lock);
+    //printf("acquire global lock\n");
 
     token_t tokens[MAX_TOKENS];
     size_t ntokens;
@@ -4746,6 +4840,7 @@ static void process_command(conn *c, char *command) {
     }
 
     ntokens = tokenize_command(command, tokens, MAX_TOKENS);
+
     if (ntokens >= 3 &&
         ((strcmp(tokens[COMMAND_TOKEN].value, "get") == 0) ||
          (strcmp(tokens[COMMAND_TOKEN].value, "bget") == 0))) {
@@ -5040,6 +5135,9 @@ static void process_command(conn *c, char *command) {
             out_string(c, "ERROR");
         }
     }
+
+    // pthread_mutex_unlock(&global_lock);
+    // printf("release global lock\n");
     return;
 }
 
@@ -5550,7 +5648,7 @@ static int read_into_chunked_item(conn *c) {
             } else {
                 /* Allocate next chunk. Binary protocol needs 2b for \r\n */
                 c->ritem = (char *) do_item_alloc_chunk(ch, c->rlbytes +
-                       ((c->protocol == binary_prot) ? 2 : 0));
+                       ((c->protocol == binary_prot) ? 2 : 0), c->thread);
                 if (!c->ritem) {
                     // We failed an allocation. Let caller handle cleanup.
                     total = -2;
@@ -5606,7 +5704,7 @@ static int read_into_chunked_item(conn *c) {
     if (c->rlbytes == 0 && c->protocol == binary_prot && total >= 0) {
         item_chunk *ch = (item_chunk *)c->ritem;
         if (ch->size - ch->used < 2) {
-            c->ritem = (char *) do_item_alloc_chunk(ch, 2);
+            c->ritem = (char *) do_item_alloc_chunk(ch, 2, c->thread);
             if (!c->ritem) {
                 total = -2;
             }
@@ -5735,7 +5833,6 @@ static void drive_machine(conn *c) {
                 conn_set_state(c, conn_closing);
                 break;
             }
-
             conn_set_state(c, conn_read);
             stop = true;
             break;
@@ -5764,7 +5861,6 @@ static void drive_machine(conn *c) {
                 /* wee need more data! */
                 conn_set_state(c, conn_waiting);
             }
-
             break;
 
         case conn_new_cmd:
@@ -6000,7 +6096,8 @@ static void drive_machine(conn *c) {
             }
             break;
 
-        case conn_closing:
+        case conn_closing:        
+
             if (IS_UDP(c->transport))
                 conn_cleanup(c);
             else
@@ -6022,7 +6119,6 @@ static void drive_machine(conn *c) {
             break;
         }
     }
-
     return;
 }
 
@@ -6740,7 +6836,6 @@ static void remove_pidfile(const char *pid_file) {
 }
 
 static void sig_handler(const int sig) {
-    printf("Signal handled: %s.\n", strsignal(sig));
     exit(EXIT_SUCCESS);
 }
 
@@ -7084,6 +7179,12 @@ int main (int argc, char **argv) {
     ext_cf.page_buckets = 4;
     ext_cf.wbuf_count = ext_cf.page_buckets;
 #endif
+
+    // init global lock
+    if (pthread_mutex_init(&global_lock, NULL) != 0){
+        printf("mutex_init failed!\n");
+        return 1;
+    }
 
     /* Run regardless of initializing it later */
     init_lru_maintainer();
@@ -7482,7 +7583,7 @@ int main (int argc, char **argv) {
                 settings.lru_crawler_tocrawl = tocrawl;
                 break;
             case LRU_MAINTAINER:
-                start_lru_maintainer = true;
+                start_lru_maintainer = false;
                 settings.lru_segmented = true;
                 break;
             case HOT_LRU_PCT:

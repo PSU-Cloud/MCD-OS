@@ -81,6 +81,7 @@ unsigned int item_lock_hashpower;
  * can use to signal that they've put a new connection on its queue.
  */
 static LIBEVENT_THREAD *threads;
+// LIBEVENT_THREAD *threads;   // remove static, we may get addresses of threads in item.c
 
 /*
  * Number of worker threads that have finished setting themselves up.
@@ -89,6 +90,9 @@ static int init_count = 0;
 static pthread_mutex_t init_lock;
 static pthread_cond_t init_cond;
 
+LIBEVENT_THREAD *get_thread(int thread_id){
+    return &threads[thread_id];
+}
 
 static void thread_libevent_process(int fd, short which, void *arg);
 
@@ -101,7 +105,7 @@ static void thread_libevent_process(int fd, short which, void *arg);
  */
 
 void item_lock(uint32_t hv) {
-    mutex_lock(&item_locks[hv & hashmask(item_lock_hashpower)]);
+    // mutex_lock(&item_locks[hv & hashmask(item_lock_hashpower)]);
 }
 
 void *item_trylock(uint32_t hv) {
@@ -573,10 +577,10 @@ void sidethread_conn_close(conn *c) {
 /*
  * Allocates a new item.
  */
-item *item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbytes) {
+item *item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbytes, LIBEVENT_THREAD *thread) {
     item *it;
     /* do_item_alloc handles its own locks */
-    it = do_item_alloc(key, nkey, flags, exptime, nbytes);
+    it = do_item_alloc(key, nkey, flags, exptime, nbytes, thread);
     return it;
 }
 
@@ -588,9 +592,9 @@ item *item_get(const char *key, const size_t nkey, conn *c, const bool do_update
     item *it;
     uint32_t hv;
     hv = hash(key, nkey);
-    item_lock(hv);
+    // item_lock(hv);
     it = do_item_get(key, nkey, hv, c, do_update);
-    item_unlock(hv);
+    // item_unlock(hv);
     return it;
 }
 
@@ -609,23 +613,23 @@ item *item_touch(const char *key, size_t nkey, uint32_t exptime, conn *c) {
     item *it;
     uint32_t hv;
     hv = hash(key, nkey);
-    item_lock(hv);
+    // item_lock(hv);
     it = do_item_touch(key, nkey, exptime, hv, c);
-    item_unlock(hv);
+    // item_unlock(hv);
     return it;
 }
 
 /*
  * Links an item into the LRU and hashtable.
  */
-int item_link(item *item) {
+int item_link(item *item, LIBEVENT_THREAD *thread) {
     int ret;
     uint32_t hv;
 
     hv = hash(ITEM_key(item), item->nkey);
-    item_lock(hv);
-    ret = do_item_link(item, hv);
-    item_unlock(hv);
+    // item_lock(hv);
+    ret = do_item_link(item, thread, hv, true);   // since we link it to hashtable, it must be a new item to current thread, need deflation 
+    // item_unlock(hv);
     return ret;
 }
 
@@ -647,18 +651,26 @@ void item_remove(item *item) {
  * Unprotected by a mutex lock since the core server does not require
  * it to be thread-safe.
  */
-int item_replace(item *old_it, item *new_it, const uint32_t hv) {
-    return do_item_replace(old_it, new_it, hv);
+int item_replace(item *old_it, item *new_it, LIBEVENT_THREAD *thread, const uint32_t hv) {
+    return do_item_replace(old_it, new_it, thread, hv);
 }
 
 /*
  * Unlinks an item from the LRU and hashtable.
  */
-void item_unlink(item *item) {
+void item_unlink(item *item, LIBEVENT_THREAD *thread) {
     uint32_t hv;
     hv = hash(ITEM_key(item), item->nkey);
     item_lock(hv);
-    do_item_unlink(item, hv);
+    do_item_unlink(item, thread, hv, true);
+    item_unlock(hv);
+}
+
+void item_unlink_inall(item *item) {
+    uint32_t hv;
+    hv = hash(ITEM_key(item), item->nkey);
+    item_lock(hv);
+    do_item_unlink_inall(item, hv);
     item_unlock(hv);
 }
 
@@ -775,6 +787,10 @@ void slab_stats_aggregate(struct thread_stats *stats, struct slab_stats *out) {
  * nthreads  Number of worker event handler threads to spawn
  */
 void memcached_thread_init(int nthreads, void *arg) {
+    //XXX: MCD-OS config
+    int allocation[NUM_WORKERS] = {1000000000*0.1, 1000000000*0.2, 1000000000*0.7,
+                                   1000000000*0.2, 1000000000*0.7, 1000000000*0.1,
+                                   1000000000*0.7, 1000000000*0.1, 1000000000*0.2};
     int         i;
     int         power;
 
@@ -829,13 +845,24 @@ void memcached_thread_init(int nthreads, void *arg) {
         perror("Can't allocate thread descriptors");
         exit(1);
     }
-
+   
     for (i = 0; i < nthreads; i++) {
         int fds[2];
         if (pipe(fds)) {
             perror("Can't create notify pipe");
             exit(1);
         }
+
+        /* init threads[i] */
+        threads[i].id = i;
+        // threads[i].alloc_size = settings.maxbytes/NUM_WORKERS;
+        threads[i].alloc_size = allocation[i];
+        threads[i].avail_size = threads[i].alloc_size;
+        threads[i].attrib_size = 0;
+        // for (int j = 0; j < NUM_SUB_LRU_LISTS; j++){
+        //     threads[i].heads[j] = NULL;
+        //     threads[i].tails[j] = NULL;
+        // } no need to maintain LRU in each thread
 
         threads[i].notify_receive_fd = fds[0];
         threads[i].notify_send_fd = fds[1];

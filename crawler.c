@@ -216,8 +216,8 @@ static void crawler_expired_eval(crawler_module_t *cm, item *search, uint32_t hv
 #ifdef EXTSTORE
         STORAGE_delete(storage, search);
 #endif
-        do_item_unlink_nolock(search, hv);
-        do_item_remove(search);
+        // do_item_unlink_nolock(search, hv);
+        // do_item_remove(search);
     } else {
         s->seen++;
         refcount_decr(search);

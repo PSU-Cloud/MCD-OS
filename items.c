@@ -5,6 +5,8 @@
 #ifdef EXTSTORE
 #include "storage.h"
 #include "slab_automove_extstore.h"
+#include "thread.c"
+#include "slabs.c"
 #endif
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -21,9 +23,12 @@
 #include <unistd.h>
 #include <poll.h>
 
+
 /* Forward Declarations */
-static void item_link_q(item *it);
-static void item_unlink_q(item *it);
+// static void item_link_q(item *it);
+static void item_link_q(item *it, int thread_id);
+// static void item_unlink_q(item *it);
+static void item_unlink_q(item *it, int thread_id);
 
 static unsigned int lru_type_map[4] = {HOT_LRU, WARM_LRU, COLD_LRU, TEMP_LRU};
 
@@ -51,8 +56,11 @@ typedef struct {
     rel_time_t evicted_time;
 } itemstats_t;
 
-static item *heads[LARGEST_ID];
-static item *tails[LARGEST_ID];
+/* slab class's LRU */
+// static item *heads[LARGEST_ID];
+// static item *tails[LARGEST_ID];
+static item *heads[NUM_WORKERS * NUM_SUB_LRU_LISTS];
+static item *tails[NUM_WORKERS * NUM_SUB_LRU_LISTS];
 static itemstats_t itemstats[LARGEST_ID];
 static unsigned int sizes[LARGEST_ID];
 static uint64_t sizes_bytes[LARGEST_ID];
@@ -66,12 +74,218 @@ static pthread_mutex_t lru_maintainer_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t cas_id_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t stats_sizes_lock = PTHREAD_MUTEX_INITIALIZER;
 
+struct counting *check_item(item *it) {   /* return the number of LRUs containing this item */
+    // int result = 0; 
+    struct counting *result = (struct counting *)malloc(sizeof(struct counting));
+    result->N = 0;
+    result->P = NULL;  // head of set of threads containing this item
+    int LRU_id;
+    item **head, **tail;
+    for (int i = 0; i < NUM_WORKERS; i++){
+        LRU_id = i*NUM_SUB_LRU_LISTS + it->lru[i];
+        head = &heads[LRU_id];
+        tail = &tails[LRU_id];
+        if (it->prevs[i] != NULL || it->nexts[i] != NULL || (*head == it && *tail == it)){  // LRU i is containing this item
+            //printf("LRU %d has this item\n", LRU_id);
+            // result++;
+            result->N++;
+            struct thread_set *tmp = (struct thread_set *)malloc(sizeof(struct thread_set));  
+            if(tmp){    // add this thread to set P
+                tmp->prev = NULL;
+                tmp->next = NULL;
+                // tmp->thread = &threads[i];
+                tmp->thread = get_thread(i);
+                if(result->P){
+                    tmp->next = result->P;
+                    result->P->prev = tmp;
+                }
+                result->P = tmp;
+            }else{
+                //printf("Allocation Failed for threads set\n");
+            }
+            // printf("make sure it's thread %d\n", tmp->thread->id);
+        }
+    }
+    //printf("shared by %d threads\n", result->N);
+    return result;
+}
+
+bool LRU_item(item *it, int thread_id){  // check whether current LRU contains this item
+    bool result = false;
+    int LRU_id = thread_id*NUM_SUB_LRU_LISTS + it->lru[thread_id];
+    item **head, **tail;
+    head = &heads[LRU_id];
+    tail = &tails[LRU_id];
+    if (it->prevs[thread_id] != NULL || it->nexts[thread_id] != NULL || (*head == it && *tail == it)){
+        result = true;
+    }
+    
+    return result;
+}
+
+void inflation(item *it, struct counting *result){
+    struct thread_set *tmp = result->P;
+    uint32_t hv;
+    int LRU_id;
+    item *evict_item;
+    int item_size = slabs_size(it->slabs_clsid);
+    int new_virtual_len = item_size/result->N;
+    int diff = new_virtual_len - it->virtual_len;
+    it->virtual_len = new_virtual_len;
+    
+    while(tmp != NULL){
+        tmp->thread->attrib_size += diff;
+        tmp->thread->avail_size -= diff;
+        LRU_id = tmp->thread->id * NUM_SUB_LRU_LISTS + it->lru[tmp->thread->id];
+        sizes_bytes[LRU_id] += diff;
+        tmp = tmp->next;
+    }
+    tmp = result->P;
+    while(tmp != NULL){
+        // here we use a while loop since we may need to evict more than one item
+        while(tmp->thread->attrib_size > tmp->thread->alloc_size){
+            evict_item = eviction_candidate(tmp->thread);  
+            hv = hash(ITEM_key(evict_item), evict_item->nkey);
+            do_item_unlink(evict_item, tmp->thread, hv, false);
+        }
+        tmp = tmp->next;
+    }
+    //release 
+    free_result(result);
+    return;
+}
+
+void deflation(item *it, LIBEVENT_THREAD *thread, struct counting *result){
+    struct thread_set *tmp = result->P;
+    item *evict_item;
+    uint32_t hv;
+    int LRU_id;
+    int item_size = slabs_size(it->slabs_clsid);
+    int new_virtual_len = item_size/result->N;
+    int diff = it->virtual_len - new_virtual_len;
+    it->virtual_len = new_virtual_len;
+
+    thread->attrib_size += it->virtual_len;
+    thread->avail_size -= it->virtual_len;
+
+    while(tmp != NULL){
+        if(tmp->thread != thread){
+            tmp->thread->attrib_size -= diff;
+            tmp->thread->avail_size += diff;
+        }
+        LRU_id = tmp->thread->id * NUM_SUB_LRU_LISTS + it->lru[tmp->thread->id];
+        sizes_bytes[LRU_id] -= diff;
+        tmp = tmp->next;
+    }
+    // check whether current thread has enough room for item it
+    // may evict more than one item
+    while(thread->attrib_size > thread->alloc_size){
+        evict_item = eviction_candidate(thread);
+        hv = hash(ITEM_key(evict_item), evict_item->nkey);
+        do_item_unlink(evict_item, thread, hv, false);       
+    }
+    free_result(result);
+    return;
+}
+
+item *eviction_candidate(LIBEVENT_THREAD *thread){
+    //if flat LRU, cold must not be empty
+    item *evict_item;
+    int LRU_id = thread->id * NUM_SUB_LRU_LISTS + COLD_LRU;  // first search in cold
+    evict_item = tails[LRU_id];
+    if(!evict_item){
+        // cold is empty
+        LRU_id = LRU_id - COLD_LRU + WARM_LRU;  // then search in warm
+        evict_item = tails[LRU_id];
+        if(!evict_item){
+            // warm is empty
+            LRU_id = LRU_id - WARM_LRU + HOT_LRU;  // then search in hot
+            evict_item = tails[LRU_id];  //  it must not be NULL otherwise the current thread won't exceed limit.
+        }
+    }
+    return evict_item;
+}
+
+void free_result(struct counting *result){
+    struct thread_set *ptr = result->P;
+    struct thread_set *tmp;
+    // first release linked list containing pointers to threads (P)
+    while(ptr != NULL){
+        tmp = ptr;
+        ptr = ptr->next;
+        free(tmp);
+    }
+    // then release result
+    free(result);
+}
+
+void check_S_LRU(uint8_t cur_lru, LIBEVENT_THREAD *thread){
+    int LRU_id = thread->id * NUM_SUB_LRU_LISTS + cur_lru;
+    int limit;
+    item *search;
+    switch(cur_lru){  // item is transferred among S-LRUs in the same LRU, so no inflation or deflation is needed
+        case HOT_LRU:
+            /* the last item must be removed */
+            limit = thread->attrib_size * settings.hot_lru_pct / 100;
+            while(sizes_bytes[LRU_id] > limit){
+                search = tails[LRU_id];   // reaches limit, it must not be null
+                // printf("now tail is %s\n", ITEM_key(tail));
+                // printf("tail active flag: %d\n", (int)(tail->it_flag[thread->id] & ITEM_ACTIVE));
+                // printf("tail linked flag: %d\n", (int)(tail->it_flag[thread->id] & ITEM_LINKED));
+                // if((tail->it_flag[thread->id] & ITEM_LINKED) ==0 )
+                //     abort();
+                if((search->it_flag[thread->id] & ITEM_ACTIVE) !=0 ){
+                    // item is active
+                    search->it_flag[thread->id] &= ~ITEM_ACTIVE;  // set to inactive
+                    item_unlink_q(search, thread->id);   // S-LRU size is updated here
+                    search->lru[thread->id] = WARM_LRU;
+                    item_link_q(search, thread->id);   // S-LRU size is updated here
+                    check_S_LRU(WARM_LRU, thread);
+                }else{
+                    // item is inactive
+                    item_unlink_q(search, thread->id);
+                    search->lru[thread->id] = COLD_LRU;
+                    item_link_q(search, thread->id);
+                }
+            }
+            break;
+
+        case WARM_LRU:
+            /* the last item: 1)active, bump; 2)inactive, remove */
+            limit = thread->attrib_size * settings.warm_lru_pct / 100;
+            while(sizes_bytes[LRU_id] > limit){
+                search = tails[LRU_id];  // reaches limit, it must not be null
+                while(search){
+                    if((search->it_flag[thread->id] & ITEM_ACTIVE) == 0){
+                        // inactive
+                        item_unlink_q(search, thread->id);
+                        search->lru[thread->id] = COLD_LRU;
+                        item_link_q(search, thread->id);
+                        break;  // break while loop
+                    }else{
+                        // active, bump to head and check the new tail
+                        search->it_flag[thread->id] &= ~ITEM_ACTIVE;  // set to inactive
+                        item_unlink_q(search, thread->id);
+                        item_link_q(search, thread->id);
+                        search = tails[LRU_id];  // check the new tail 
+                    }
+                }
+            }
+            break;
+
+        case COLD_LRU:
+            // no limit
+            break;
+    }
+    //printf("thread %d:\nHOT size is %d, WARM size is %d, COLD size is %d\n",thread->id, (int)sizes_bytes[thread->id * NUM_SUB_LRU_LISTS + HOT_LRU], (int)sizes_bytes[thread->id * NUM_SUB_LRU_LISTS + WARM_LRU], (int)sizes_bytes[thread->id * NUM_SUB_LRU_LISTS + COLD_LRU]);
+}
+
 void item_stats_reset(void) {
     int i;
     for (i = 0; i < LARGEST_ID; i++) {
-        pthread_mutex_lock(&lru_locks[i]);
+        // pthread_mutex_lock(&lru_locks[i]);
         memset(&itemstats[i], 0, sizeof(itemstats_t));
-        pthread_mutex_unlock(&lru_locks[i]);
+        // pthread_mutex_unlock(&lru_locks[i]);
     }
 }
 
@@ -102,7 +316,8 @@ static pthread_mutex_t bump_buf_lock = PTHREAD_MUTEX_INITIALIZER;
 /* TODO: tunable? Need bench results */
 #define LRU_BUMP_BUF_SIZE 8192
 
-static bool lru_bump_async(lru_bump_buf *b, item *it, uint32_t hv);
+// NOT used in our experiment
+// static bool lru_bump_async(lru_bump_buf *b, item *it, uint32_t hv);
 static uint64_t lru_total_bumps_dropped(void);
 
 /* Get the next CAS id for a new item. */
@@ -132,9 +347,9 @@ static unsigned int temp_lru_size(int slabs_clsid) {
     int id = CLEAR_LRU(slabs_clsid);
     id |= TEMP_LRU;
     unsigned int ret;
-    pthread_mutex_lock(&lru_locks[id]);
+    // pthread_mutex_lock(&lru_locks[id]);
     ret = sizes_bytes[id];
-    pthread_mutex_unlock(&lru_locks[id]);
+    // pthread_mutex_unlock(&lru_locks[id]);
     return ret;
 }
 
@@ -176,44 +391,65 @@ static size_t item_make_header(const uint8_t nkey, const unsigned int flags, con
     return sizeof(item) + nkey + *nsuffix + nbytes;
 }
 
-item *do_item_alloc_pull(const size_t ntotal, const unsigned int id) {
+item *do_item_alloc_pull(const size_t ntotal, const unsigned int id, LIBEVENT_THREAD *thread) {
     item *it = NULL;
-    int i;
+    // int i;
     /* If no memory is available, attempt a direct LRU juggle/eviction */
     /* This is a race in order to simplify lru_pull_tail; in cases where
      * locked items are on the tail, you want them to fall out and cause
      * occasional OOM's, rather than internally work around them.
      * This also gives one fewer code path for slab alloc/free
      */
-    for (i = 0; i < 10; i++) {
-        uint64_t total_bytes;
-        /* Try to reclaim memory first */
-        if (!settings.lru_segmented) {
-            lru_pull_tail(id, COLD_LRU, 0, 0, 0, NULL);
-        }
+    
+    uint64_t total_bytes;
+    it = slabs_alloc(ntotal, id, &total_bytes, 0);
+    int i;
+    for( i = 0 && it==NULL; i < 10 && it == NULL; i++)
         it = slabs_alloc(ntotal, id, &total_bytes, 0);
 
-        if (settings.temp_lru)
-            total_bytes -= temp_lru_size(id);
-
-        if (it == NULL) {
-            if (lru_pull_tail(id, COLD_LRU, total_bytes, LRU_PULL_EVICT, 0, NULL) <= 0) {
-                if (settings.lru_segmented) {
-                    lru_pull_tail(id, HOT_LRU, total_bytes, 0, 0, NULL);
-                } else {
-                    break;
-                }
-            }
-        } else {
-            break;
-        }
+    if (it==NULL){
+        /* in theory, it must not be null, since thread size << cahce size */
+        printf("can't allocate item!\n");
+        abort();
     }
 
-    if (i > 0) {
-        pthread_mutex_lock(&lru_locks[id]);
-        itemstats[id].direct_reclaims += i;
-        pthread_mutex_unlock(&lru_locks[id]);
-    }
+    /******/
+    // for (i = 0; i < 10; i++) {
+    //     uint64_t total_bytes;
+    //     // /* Try to reclaim memory first */
+    //     // if (!settings.lru_segmented) {
+    //     //     // lru_pull_tail(id, COLD_LRU, 0, 0, 0, NULL);
+    //     //     lru_pull_tail(thread, id, COLD_LRU, 0, 0, 0, NULL);
+    //     // }
+    //     it = slabs_alloc(ntotal, id, &total_bytes, 0);  // try allocate item first
+
+    //     if (settings.temp_lru)
+    //         total_bytes -= temp_lru_size(id);
+
+    //     if (it == NULL) { // if slabclass i is full, we need to reclaim items
+    //         // // if (lru_pull_tail(id, COLD_LRU, total_bytes, LRU_PULL_EVICT, 0, NULL) <= 0) {
+    //         // if (lru_pull_tail(thread, id, COLD_LRU, total_bytes, LRU_PULL_EVICT, 0, NULL) <= 0) {
+    //         //     if (settings.lru_segmented) {
+    //         //         // lru_pull_tail(id, HOT_LRU, total_bytes, 0, 0, NULL);
+    //         //         lru_pull_tail(thread, id, HOT_LRU, total_bytes, 0, 0, NULL);
+    //         //     } else {
+    //         //         break;
+    //         //     }
+    //         // }
+    //         printf("this slab is full, reclaiming item...\n");
+    //         printf("the %dth trial\n", i);
+    //         slab_pull_tail(id);
+    //     } else {  // if there's free item, just return it
+    //         break;
+    //     }
+    // }
+
+    // if (i > 0) {
+    //     // pthread_mutex_lock(&lru_locks[id]);
+    //     itemstats[id].direct_reclaims += i;
+    //     // pthread_mutex_unlock(&lru_locks[id]);
+    // }
+    /******/
 
     return it;
 }
@@ -223,14 +459,14 @@ item *do_item_alloc_pull(const size_t ntotal, const unsigned int id) {
  * flag, it counts as busy and skips.
  * I think it might still not be safe to do linking outside of the slab lock
  */
-item_chunk *do_item_alloc_chunk(item_chunk *ch, const size_t bytes_remain) {
+item_chunk *do_item_alloc_chunk(item_chunk *ch, const size_t bytes_remain, LIBEVENT_THREAD *thread) {
     // TODO: Should be a cleaner way of finding real size with slabber calls
     size_t size = bytes_remain + sizeof(item_chunk);
     if (size > settings.slab_chunk_size_max)
         size = settings.slab_chunk_size_max;
     unsigned int id = slabs_clsid(size);
 
-    item_chunk *nch = (item_chunk *) do_item_alloc_pull(size, id);
+    item_chunk *nch = (item_chunk *) do_item_alloc_pull(size, id, thread);
     if (nch == NULL)
         return NULL;
 
@@ -250,7 +486,7 @@ item_chunk *do_item_alloc_chunk(item_chunk *ch, const size_t bytes_remain) {
 }
 
 item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
-                    const rel_time_t exptime, const int nbytes) {
+                    const rel_time_t exptime, const int nbytes, LIBEVENT_THREAD *thread) {
     uint8_t nsuffix;
     item *it = NULL;
     char suffix[40];
@@ -267,6 +503,8 @@ item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
     unsigned int hdr_id = 0;
     if (id == 0)
         return 0;
+
+    // int thread_id = thread->id;   // number id of current thread 
 
     /* This is a large item. Allocate a header object now, lazily allocate
      *  chunks while reading the upload.
@@ -288,52 +526,66 @@ item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
         }
 #endif
         hdr_id = slabs_clsid(htotal);
-        it = do_item_alloc_pull(htotal, hdr_id);
+        it = do_item_alloc_pull(htotal, hdr_id, thread);
         /* setting ITEM_CHUNKED is fine here because we aren't LINKED yet. */
         if (it != NULL)
             it->it_flags |= ITEM_CHUNKED;
     } else {
-        it = do_item_alloc_pull(ntotal, id);
+        it = do_item_alloc_pull(ntotal, id, thread);
     }
 
     if (it == NULL) {
-        pthread_mutex_lock(&lru_locks[id]);
+        // pthread_mutex_lock(&lru_locks[id]);
         itemstats[id].outofmemory++;
-        pthread_mutex_unlock(&lru_locks[id]);
+        // pthread_mutex_unlock(&lru_locks[id]);
         return NULL;
     }
 
-    assert(it->slabs_clsid == 0);
+    //printf("successfully allocate an item in slab.\n");
+    // assert(it->slabs_clsid == 0);
     //assert(it != heads[id]);
 
     /* Refcount is seeded to 1 by slabs_alloc() */
-    it->next = it->prev = 0;
+    //it->next = it->prev = 0;
+    for (int i = 0; i< NUM_WORKERS; i++) {
+        it->it_flag[i] &= 0;
+        it->nexts[i] = it->prevs[i] = NULL;
+        if(settings.lru_segmented){
+            it->lru[i] = HOT_LRU;
+        }else{
+            it->lru[i] = COLD_LRU;
+        }
+        // it->lru[i] = COLD_LRU;
+    }
 
     /* Items are initially loaded into the HOT_LRU. This is '0' but I want at
      * least a note here. Compiler (hopefully?) optimizes this out.
      */
-    if (settings.temp_lru &&
-            exptime - current_time <= settings.temporary_ttl) {
-        id |= TEMP_LRU;
-    } else if (settings.lru_segmented) {
-        id |= HOT_LRU;
-    } else {
-        /* There is only COLD in compat-mode */
-        id |= COLD_LRU;
-    }
+    // if (settings.temp_lru &&
+    //         exptime - current_time <= settings.temporary_ttl) {
+    //     //id |= TEMP_LRU;
+    //     it->lru[thread_id] = TEMP_LRU;
+    // } else if (settings.lru_segmented) {
+    //     //id |= HOT_LRU;
+    //     it->lru[thread_id] = HOT_LRU;
+    // } else {
+    //     /* There is only COLD in compat-mode */
+    //     //id |= COLD_LRU;
+    //     it->lru[thread_id] = COLD_LRU;
+    // }
     it->slabs_clsid = id;
 
     DEBUG_REFCNT(it, '*');
-    it->it_flags |= settings.use_cas ? ITEM_CAS : 0;
+    it->it_flags |= settings.use_cas ? ITEM_CAS : 0;  // it_flag[i]: only used in ACTIVE & FETCHED & LINKED & SLABBED
     it->it_flags |= nsuffix != 0 ? ITEM_CFLAGS : 0;
     it->nkey = nkey;
     it->nbytes = nbytes;
+    it->virtual_len = slabs_size(it->slabs_clsid);   /* when an item is allocated in the beginning, its virtual length equals to its actual length */
     memcpy(ITEM_key(it), key, nkey);
     it->exptime = exptime;
     if (nsuffix > 0) {
         memcpy(ITEM_suffix(it), &flags, sizeof(flags));
     }
-
     /* Initialize internal chunk. */
     if (it->it_flags & ITEM_CHUNKED) {
         item_chunk *chunk = (item_chunk *) ITEM_schunk(it);
@@ -353,14 +605,23 @@ item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
 void item_free(item *it) {
     size_t ntotal = ITEM_ntotal(it);
     unsigned int clsid;
-    assert((it->it_flags & ITEM_LINKED) == 0);
-    assert(it != heads[it->slabs_clsid]);
-    assert(it != tails[it->slabs_clsid]);
+    int LRU_id;
+    // assert(it != heads[it->slabs_clsid]);
+    // assert(it != tails[it->slabs_clsid]);
+    for (int i=0; i<NUM_WORKERS; i++){
+        assert((it->it_flag[i] & ITEM_LINKED) == 0);
+        it->it_flag[i] = ITEM_SLABBED;
+        LRU_id = i*NUM_SUB_LRU_LISTS + it->lru[i];
+        assert(it != heads[LRU_id]);
+        assert(it != tails[LRU_id]);
+    }
     assert(it->refcount == 0);
 
     /* so slab size changer can tell later if item is already free or not */
-    clsid = ITEM_clsid(it);
+    // clsid = ITEM_clsid(it);
+    clsid = it->slabs_clsid;
     DEBUG_REFCNT(it, 'F');
+    //printf("remove key %s from cache\n", ITEM_key(it));
     slabs_free(it, ntotal, clsid);
 }
 
@@ -383,88 +644,155 @@ bool item_size_ok(const size_t nkey, const int flags, const int nbytes) {
     return slabs_clsid(ntotal) != 0;
 }
 
-static void do_item_link_q(item *it) { /* item is the new head */
+// static void do_item_link_q(item *it) { /* item is the new head */
+static void do_item_link_q(item *it, int thread_id) { /* item is the new head */
+    int LRU_id = thread_id * NUM_SUB_LRU_LISTS + it->lru[thread_id];
     item **head, **tail;
-    assert((it->it_flags & ITEM_SLABBED) == 0);
+    assert((it->it_flag[thread_id] & ITEM_SLABBED) == 0);
 
-    head = &heads[it->slabs_clsid];
-    tail = &tails[it->slabs_clsid];
+    // head = &heads[it->slabs_clsid];
+    // tail = &tails[it->slabs_clsid];
+    head = &heads[LRU_id];
+    tail = &tails[LRU_id];
+    
     assert(it != *head);
     assert((*head && *tail) || (*head == 0 && *tail == 0));
-    it->prev = 0;
-    it->next = *head;
-    if (it->next) it->next->prev = it;
+    // it->prev = 0;
+    // it->next = *head;
+    it->prevs[thread_id] = 0;
+    it->nexts[thread_id] = *head;
+    // if (it->next) it->next->prev = it;
+    if (it->nexts[thread_id]) it->nexts[thread_id]->prevs[thread_id] = it;
     *head = it;
     if (*tail == 0) *tail = it;
-    sizes[it->slabs_clsid]++;
+    // sizes[it->slabs_clsid]++;
+    sizes[LRU_id]++;
 #ifdef EXTSTORE
     if (it->it_flags & ITEM_HDR) {
-        sizes_bytes[it->slabs_clsid] += (ITEM_ntotal(it) - it->nbytes) + sizeof(item_hdr);
+        // sizes_bytes[it->slabs_clsid] += (ITEM_ntotal(it) - it->nbytes) + sizeof(item_hdr);
+        sizes_bytes[LRU_id] += it->virtual_len;
     } else {
-        sizes_bytes[it->slabs_clsid] += ITEM_ntotal(it);
+        // sizes_bytes[it->slabs_clsid] += ITEM_ntotal(it);
+        sizes_bytes[LRU_id] += it->virtual_len;
     }
 #else
-    sizes_bytes[it->slabs_clsid] += ITEM_ntotal(it);
+    // sizes_bytes[it->slabs_clsid] += ITEM_ntotal(it);
+    sizes_bytes[LRU_id] += it->virtual_len;
 #endif
 
     return;
 }
 
-static void item_link_q(item *it) {
-    pthread_mutex_lock(&lru_locks[it->slabs_clsid]);
-    do_item_link_q(it);
-    pthread_mutex_unlock(&lru_locks[it->slabs_clsid]);
+// static void item_link_q(item *it) {
+static void item_link_q(item *it, int thread_id) {
+    // pthread_mutex_lock(&lru_locks[it->slabs_clsid]);
+    // int id = thread->id * NUM_SUB_LRU_LISTS + it->lru[thread->id];
+    // pthread_mutex_lock(&lru_locks[id]);
+    if((it->it_flag[thread_id] & ITEM_LINKED) == 0){
+        it->it_flag[thread_id] |= ITEM_LINKED;
+        do_item_link_q(it, thread_id);
+    }
+    // pthread_mutex_unlock(&lru_locks[it->slabs_clsid]);
+    // pthread_mutex_unlock(&lru_locks[id]);
 }
 
-static void item_link_q_warm(item *it) {
-    pthread_mutex_lock(&lru_locks[it->slabs_clsid]);
-    do_item_link_q(it);
-    itemstats[it->slabs_clsid].moves_to_warm++;
-    pthread_mutex_unlock(&lru_locks[it->slabs_clsid]);
+void item_link_LRU(item *it, int thread_id){
+    if((it->it_flag[thread_id] & ITEM_LINKED) == 0){
+        it->it_flag[thread_id] |= ITEM_LINKED;
+        do_item_link_q(it, thread_id);
+    }
 }
 
-static void do_item_unlink_q(item *it) {
+// static void item_link_q_warm(item *it) {
+static void item_link_q_warm(item *it, int thread_id) {
+    // pthread_mutex_lock(&lru_locks[it->slabs_clsid]);
+    int LRU_id = thread_id * NUM_SUB_LRU_LISTS + it->lru[thread_id];
+    // pthread_mutex_lock(&lru_locks[id]);
+    if((it->it_flag[thread_id] & ITEM_LINKED) == 0){
+        it->it_flag[thread_id] |= ITEM_LINKED;
+        do_item_link_q(it, thread_id);
+    }
+    // itemstats[it->slabs_clsid].moves_to_warm++;
+    // pthread_mutex_unlock(&lru_locks[it->slabs_clsid]);
+    itemstats[LRU_id].moves_to_warm++;
+    // pthread_mutex_unlock(&lru_locks[id]);
+}
+
+// static void do_item_unlink_q(item *it) {
+static void do_item_unlink_q(item *it, int thread_id) {
     item **head, **tail;
-    head = &heads[it->slabs_clsid];
-    tail = &tails[it->slabs_clsid];
+    // head = &heads[it->slabs_clsid];
+    // tail = &tails[it->slabs_clsid];
+    // int cur_lru = it->lru[thread_id];
+    int LRU_id = thread_id * NUM_SUB_LRU_LISTS + it->lru[thread_id];
+    head = &heads[LRU_id];
+    tail = &tails[LRU_id];
 
     if (*head == it) {
-        assert(it->prev == 0);
-        *head = it->next;
+        // assert(it->prev == 0);
+        // *head = it->next;
+        assert(it->prevs[thread_id] == 0);
+        *head = it->nexts[thread_id];
     }
     if (*tail == it) {
-        assert(it->next == 0);
-        *tail = it->prev;
+        // assert(it->next == 0);
+        // *tail = it->prev;
+        assert(it->nexts[thread_id] == 0);
+        *tail = it->prevs[thread_id];
     }
-    assert(it->next != it);
-    assert(it->prev != it);
+    // assert(it->next != it);
+    // assert(it->prev != it);
+    assert(it->nexts[thread_id] != it);
+    assert(it->prevs[thread_id] != it);
 
-    if (it->next) it->next->prev = it->prev;
-    if (it->prev) it->prev->next = it->next;
-    sizes[it->slabs_clsid]--;
+    // if (it->next) it->next->prev = it->prev;
+    // if (it->prev) it->prev->next = it->next;
+    if (it->nexts[thread_id]) it->nexts[thread_id]->prevs[thread_id] = it->prevs[thread_id];
+    if (it->prevs[thread_id]) it->prevs[thread_id]->nexts[thread_id] = it->nexts[thread_id];
+
+    it->nexts[thread_id] = NULL;
+    it->prevs[thread_id] = NULL;
+    // sizes[it->slabs_clsid]--;
+    sizes[LRU_id]--;
 #ifdef EXTSTORE
     if (it->it_flags & ITEM_HDR) {
-        sizes_bytes[it->slabs_clsid] -= (ITEM_ntotal(it) - it->nbytes) + sizeof(item_hdr);
+        // sizes_bytes[it->slabs_clsid] -= (ITEM_ntotal(it) - it->nbytes) + sizeof(item_hdr);
+        sizes_bytes[LRU_id] -= it->virtual_len;
     } else {
-        sizes_bytes[it->slabs_clsid] -= ITEM_ntotal(it);
+        // sizes_bytes[it->slabs_clsid] -= ITEM_ntotal(it);
+        sizes_bytes[LRU_id] -= it->virtual_len;
     }
 #else
-    sizes_bytes[it->slabs_clsid] -= ITEM_ntotal(it);
+    // sizes_bytes[it->slabs_clsid] -= ITEM_ntotal(it);
+    sizes_bytes[LRU_id] -= it->virtual_len;
 #endif
 
     return;
 }
 
-static void item_unlink_q(item *it) {
-    pthread_mutex_lock(&lru_locks[it->slabs_clsid]);
-    do_item_unlink_q(it);
-    pthread_mutex_unlock(&lru_locks[it->slabs_clsid]);
+// static void item_unlink_q(item *it) {
+static void item_unlink_q(item *it, int thread_id) {
+    // pthread_mutex_lock(&lru_locks[it->slabs_clsid]);
+    // pthread_mutex_lock(&lru_locks[id]);
+    if((it->it_flag[thread_id] & ITEM_LINKED) != 0){
+        it->it_flag[thread_id] &= ~ITEM_LINKED;
+        do_item_unlink_q(it, thread_id);
+    }
+    // pthread_mutex_unlock(&lru_locks[it->slabs_clsid]);
+    // pthread_mutex_unlock(&lru_locks[id]);
+}
+void item_unlink_LRU(item *it, int thread_id){
+    if((it->it_flag[thread_id] & ITEM_LINKED) != 0){
+        it->it_flag[thread_id] &= ~ITEM_LINKED;
+        do_item_unlink_q(it, thread_id);
+    }
 }
 
-int do_item_link(item *it, const uint32_t hv) {
+int do_item_link(item *it, LIBEVENT_THREAD *thread, const uint32_t hv, bool new) {
     MEMCACHED_ITEM_LINK(ITEM_key(it), it->nkey, it->nbytes);
-    assert((it->it_flags & (ITEM_LINKED|ITEM_SLABBED)) == 0);
-    it->it_flags |= ITEM_LINKED;
+    // assert((it->it_flag[thread->id] & (ITEM_LINKED|ITEM_SLABBED)) == 0);
+    // it->it_flag[thread->id] |= ITEM_LINKED;  // set in item_link_q
+    assert((it->it_flag[thread->id] & ITEM_SLABBED) == 0);
     it->time = current_time;
 
     STATS_LOCK();
@@ -476,47 +804,177 @@ int do_item_link(item *it, const uint32_t hv) {
     /* Allocate a new CAS ID on link. */
     ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
     assoc_insert(it, hv);
-    item_link_q(it);
+    item_link_q(it, thread->id);
     refcount_incr(it);
     item_stats_sizes_add(it);
+    
+    struct counting *result = check_item(it);
+    int LRU_id;
+    int item_size = slabs_size(it->slabs_clsid);
+    int old_v_len = it->virtual_len;
+    int new_v_len = item_size/result->N;
+    if(new){  // this item needs to be linked to a new LRU
+        if(old_v_len == new_v_len){
+            // only update the current LRU
+            thread->attrib_size += new_v_len;
+            thread->avail_size -= new_v_len;
+            while(thread->attrib_size > thread->alloc_size){
+                item *evict_item = eviction_candidate(thread);
+                uint32_t hv = hash(ITEM_key(evict_item), evict_item->nkey);
+                do_item_unlink(evict_item, thread, hv, true);
+            }
+            free_result(result);
+        }
+        if(old_v_len > new_v_len){
+            deflation(it, thread, result);
+        }
+        if(old_v_len < new_v_len){
+            thread->attrib_size += old_v_len;
+            thread->avail_size -= old_v_len;   // diff will be added in inflation
+            inflation(it, result);
+        }      
+    }else{
+        // this item doesn't need to be linked to a new LRU, but item size may changed 
+        struct thread_set *tmp = result->P;
+        if(old_v_len > new_v_len){
+            // v_len decreases, just update each thread's attrib size
+            it->virtual_len = new_v_len;
+            int diff = old_v_len - new_v_len;
+            while(tmp != NULL){
+                tmp->thread->attrib_size -= diff;
+                tmp->thread->avail_size += diff;
+                LRU_id = tmp->thread->id * NUM_SUB_LRU_LISTS + it->lru[tmp->thread->id];
+                sizes_bytes[LRU_id] -= diff;
+                tmp = tmp->next;
+            }
+            free_result(result);
+        }
+        if(old_v_len < new_v_len){
+            // item v_len increases, need inflation
+            inflation(it, result);
+        }
+    }
+
+    if(settings.lru_segmented){
+        check_S_LRU(HOT_LRU, thread);  // no inflaiton or deflation needed here
+    }
 
     return 1;
 }
 
-void do_item_unlink(item *it, const uint32_t hv) {
-    MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
-    if ((it->it_flags & ITEM_LINKED) != 0) {
-        it->it_flags &= ~ITEM_LINKED;
+void do_item_unlink(item *it, LIBEVENT_THREAD *thread, const uint32_t hv, bool first) {   /* item is unlinked in one LRU */
+    // MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
+    // if ((it->it_flags & ITEM_LINKED) != 0) {
+    //     it->it_flags &= ~ITEM_LINKED;
+    //     item_unlink_q(it, thread);   // unlink item from LRU in current thread
+    //     if (check_item(it) == 0){
+    //          item is not shared by any LRU 
+    //         STATS_LOCK();
+    //         stats_state.curr_bytes -= ITEM_ntotal(it);
+    //         stats_state.curr_items -= 1;
+    //         STATS_UNLOCK();
+    //         item_stats_sizes_remove(it);
+    //         assoc_delete(ITEM_key(it), it->nkey, hv);
+    //         do_item_remove(it);
+    //     }
+    // }
+    
+
+    item_unlink_q(it, thread->id);   // unlink item from LRU in current thread
+
+    thread->attrib_size -= it->virtual_len;
+    thread->avail_size += it->virtual_len;
+
+    struct counting *result = check_item(it);
+
+    if (result->N == 0){
+        /* item is not shared by any LRU, remove from cache */
         STATS_LOCK();
         stats_state.curr_bytes -= ITEM_ntotal(it);
         stats_state.curr_items -= 1;
         STATS_UNLOCK();
+        MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
         item_stats_sizes_remove(it);
         assoc_delete(ITEM_key(it), it->nkey, hv);
-        item_unlink_q(it);
+        it->refcount = 1;
         do_item_remove(it);
+        free_result(result);
+    }else{
+        //printf("key %s causes inflation\n", ITEM_key(it));
+        inflation(it, result);
     }
 }
 
+void do_item_unlink_inall(item *it, const uint32_t hv){   /* item is flushed or expired, it needs to be removed in all LRUs*/
+    // MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
+    // STATS_LOCK();
+    // stats_state.curr_bytes -= ITEM_ntotal(it);
+    // stats_state.curr_items -= 1;
+    // STATS_UNLOCK();
+    // item_stats_sizes_remove(it);
+
+    struct counting *result = check_item(it);
+    struct thread_set *tmp = result->P;
+    while(tmp != NULL){
+        tmp->thread->attrib_size -= it->virtual_len;
+        tmp->thread->avail_size += it->virtual_len;
+        item_unlink_q(it, tmp->thread->id);
+        tmp = tmp->next;
+    }
+    // free result
+    free_result(result);
+
+    assoc_delete(ITEM_key(it), it->nkey, hv);
+    it->refcount = 1;
+    do_item_remove(it);
+}
+
 /* FIXME: Is it necessary to keep this copy/pasted code? */
-void do_item_unlink_nolock(item *it, const uint32_t hv) {
-    MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
-    if ((it->it_flags & ITEM_LINKED) != 0) {
-        it->it_flags &= ~ITEM_LINKED;
-        STATS_LOCK();
+void do_item_unlink_nolock(item *it, LIBEVENT_THREAD *thread, const uint32_t hv) {
+    // MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
+    // if ((it->it_flags & ITEM_LINKED) != 0) {
+    //     it->it_flags &= ~ITEM_LINKED;
+    //     do_item_unlink_q(it, thread);  // unlink item from LRU in current thread
+    //     if(check_item(it) == 0){
+    //         // item is not shared by any LRU 
+    //         STATS_LOCK();
+    //         stats_state.curr_bytes -= ITEM_ntotal(it);
+    //         stats_state.curr_items -= 1;
+    //         STATS_UNLOCK();
+    //         item_stats_sizes_remove(it);
+    //         assoc_delete(ITEM_key(it), it->nkey, hv);
+    //         do_item_remove(it);
+    //     }
+    // }
+    item_unlink_q(it, thread->id);  // unlink item from LRU in current thread
+
+    thread->attrib_size -= it->virtual_len;
+    thread->avail_size += it->virtual_len;
+
+    struct counting *result = check_item(it);
+
+    if(result->N == 0){
+        /* item is not shared by any LRU */
+        MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
+        STATS_LOCK(); 
         stats_state.curr_bytes -= ITEM_ntotal(it);
         stats_state.curr_items -= 1;
         STATS_UNLOCK();
         item_stats_sizes_remove(it);
         assoc_delete(ITEM_key(it), it->nkey, hv);
-        do_item_unlink_q(it);
+        it->refcount = 1;
         do_item_remove(it);
+        free_result(result);
+    }else{
+        inflation(it, result);
     }
 }
 
 void do_item_remove(item *it) {
     MEMCACHED_ITEM_REMOVE(ITEM_key(it), it->nkey, it->nbytes);
-    assert((it->it_flags & ITEM_SLABBED) == 0);
+    for (int i=0; i<NUM_WORKERS; i++){
+        assert((it->it_flag[i] & ITEM_SLABBED) == 0);
+    }
     assert(it->refcount > 0);
 
     if (refcount_decr(it) == 0) {
@@ -526,56 +984,153 @@ void do_item_remove(item *it) {
 
 /* Copy/paste to avoid adding two extra branches for all common calls, since
  * _nolock is only used in an uncommon case where we want to relink. */
-void do_item_update_nolock(item *it) {
+void do_item_update_nolock(item *it, int thread_id) {
     MEMCACHED_ITEM_UPDATE(ITEM_key(it), it->nkey, it->nbytes);
     if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
-        assert((it->it_flags & ITEM_SLABBED) == 0);
+        assert((it->it_flag[thread_id] & ITEM_SLABBED) == 0);
 
-        if ((it->it_flags & ITEM_LINKED) != 0) {
-            do_item_unlink_q(it);
+        if ((it->it_flag[thread_id] & ITEM_LINKED) != 0) {
+            do_item_unlink_q(it, thread_id);
             it->time = current_time;
-            do_item_link_q(it);
+            do_item_link_q(it, thread_id);
+            // bump it in slab-LRU
+            // unlink_slab_LRU(it);
+            // link_slab_LRU(it);
         }
     }
+    // MEMCACHED_ITEM_UPDATE(ITEM_key(it), it->nkey, it->nbytes);
+    // if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
+
+    //     do_item_unlink_q(it, thread_id);
+    //     it->time = current_time;
+    //     do_item_link_q(it, thread_id);
+        
+    // }
 }
 
 /* Bump the last accessed time, or relink if we're in compat mode */
-void do_item_update(item *it) {
+/* item already exists, and it doesn't need modification, just bump it to head */
+void do_item_update(item *it, LIBEVENT_THREAD *thread) {
+    int thread_id = thread->id;
+    int cur_lru = it->lru[thread_id];
     MEMCACHED_ITEM_UPDATE(ITEM_key(it), it->nkey, it->nbytes);
 
     /* Hits to COLD_LRU immediately move to WARM. */
     if (settings.lru_segmented) {
-        assert((it->it_flags & ITEM_SLABBED) == 0);
-        if ((it->it_flags & ITEM_LINKED) != 0) {
-            if (ITEM_lruid(it) == COLD_LRU && (it->it_flags & ITEM_ACTIVE)) {
+        assert((it->it_flag[thread_id] & ITEM_SLABBED) == 0);
+        if ((it->it_flag[thread_id] & ITEM_LINKED) != 0) {
+            it->time = current_time;
+            // if (ITEM_lruid(it) == COLD_LRU && (it->it_flags & ITEM_ACTIVE)) {
+            if (cur_lru == COLD_LRU && (it->it_flag[thread_id] & ITEM_ACTIVE)) {
+                
+                item_unlink_q(it, thread_id);
+                // it->slabs_clsid = ITEM_clsid(it);
+                // it->slabs_clsid |= WARM_LRU;
+                it->lru[thread_id] = WARM_LRU;
+                it->it_flag[thread_id] &= ~ITEM_ACTIVE;
+                item_link_q_warm(it, thread_id);
+                check_S_LRU(WARM_LRU, thread);  // new item linked to warm, need to check limit
+                // bump it in slab-LRU
+                // unlink_slab_LRU(it);
+                // link_slab_LRU(it);
+            }else if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
                 it->time = current_time;
-                item_unlink_q(it);
-                it->slabs_clsid = ITEM_clsid(it);
-                it->slabs_clsid |= WARM_LRU;
-                it->it_flags &= ~ITEM_ACTIVE;
-                item_link_q_warm(it);
-            } else if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
-                it->time = current_time;
-            }
+            } // no changes in HOT, WARM. active item in WARM will be bumped if it's at tail
+            // else if(cur_lru == WARM_LRU && (it->it_flag[thread_id] & ITEM_ACTIVE)){
+            //     item_unlink_q(it, thread_id);
+            //     item_link_q(it, thread_id);
+            //     unlink_slab_LRU(it);
+            //     link_slab_LRU(it);
+            // }
         }
     } else if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
-        assert((it->it_flags & ITEM_SLABBED) == 0);
+        assert((it->it_flag[thread_id] & ITEM_SLABBED) == 0);
 
-        if ((it->it_flags & ITEM_LINKED) != 0) {
+        if ((it->it_flag[thread_id] & ITEM_LINKED) != 0) {
             it->time = current_time;
-            item_unlink_q(it);
-            item_link_q(it);
+            item_unlink_q(it, thread_id);
+            item_link_q(it, thread_id);
+            // bump it in slab-LRU
+            // unlink_slab_LRU(it);
+            // link_slab_LRU(it);
         }
     }
+    
+    // int cur_lru = it->lru[thread_id];
+    // MEMCACHED_ITEM_UPDATE(ITEM_key(it), it->nkey, it->nbytes);
+
+    // /* Hits to COLD_LRU immediately move to WARM. */
+    // if (settings.lru_segmented) {
+    //     if (cur_lru == COLD_LRU) {
+    //         it->time = current_time;
+    //         item_unlink_q(it, thread);
+    //         it->lru[thread_id] = WARM_LRU;
+    //         item_link_q_warm(it, thread_id);
+    //     } else if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
+    //         it->time = current_time;
+    //     }
+    // } else if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
+    //     it->time = current_time;
+    //     item_unlink_q(it, thread_id);
+    //     item_link_q(it, thread_id);
+    // }
 }
 
-int do_item_replace(item *it, item *new_it, const uint32_t hv) {
+int do_item_replace(item *it, item *new_it, LIBEVENT_THREAD *thread, const uint32_t hv) {
     MEMCACHED_ITEM_REPLACE(ITEM_key(it), it->nkey, it->nbytes,
                            ITEM_key(new_it), new_it->nkey, new_it->nbytes);
-    assert((it->it_flags & ITEM_SLABBED) == 0);
+    assert((it->it_flag[thread->id] & ITEM_SLABBED) == 0);
 
-    do_item_unlink(it, hv);
-    return do_item_link(new_it, hv);
+    int LRU_id;
+    item **head, **tail;
+     
+    for (int i=0; i<NUM_WORKERS; i++){
+        /* replace it by new_it in LRU links */
+        new_it->lru[i] = it->lru[i];  
+        new_it->it_flag[i] = it->it_flag[i];   // copy old status
+        new_it->prevs[i] = it->prevs[i];
+        new_it->nexts[i] = it->nexts[i];
+        if(it->prevs[i]){
+            // fprintf(stderr, "item has previous link in LRU %d\n", i);
+            it->prevs[i]->nexts[i] = new_it;
+        }
+        if(it->nexts[i]){
+            // fprintf(stderr, "item has next link in LRU %d\n",i);
+            it->nexts[i]->prevs[i] = new_it;
+        }
+        /* if it is head or tail, redirect head and tail to new_it */
+        LRU_id = i*NUM_SUB_LRU_LISTS + it->lru[i];  // The id of LRU i where item it should be
+        head = &heads[LRU_id];
+        tail = &tails[LRU_id];
+        if(it == *head)
+            *head = new_it;
+        if(it == *tail)
+            *tail = new_it;
+    }
+    /* copy old virtual length */
+    new_it->virtual_len = it->virtual_len;
+
+    /* it is already unlinked in LRUs */
+    assoc_delete(ITEM_key(it), it->nkey, hv);
+    it->refcount = 1;
+    do_item_remove(it);
+
+    // do_item_unlink(it, thread_id, hv);
+    new_it->it_flag[thread->id] &= ~(ITEM_FETCHED|ITEM_ACTIVE);  // reset, since this is "new" item
+    if(LRU_item(new_it, thread->id)){  // new_it is in current LRU, just reorder the LRU
+        new_it->it_flag[thread->id] &= ~ITEM_LINKED;
+        do_item_unlink_q(new_it, thread->id);   // unlink new_it from current LRU
+        if (settings.lru_segmented)
+            new_it->lru[thread->id] = HOT_LRU;
+        return do_item_link(new_it, thread, hv, false);  // link new_it in current LRU and hashtable, no need to do deflation
+    
+    }else{
+        // new_it is new to current LRU   
+        if (settings.lru_segmented)
+            new_it->lru[thread->id] = HOT_LRU;
+        return do_item_link(new_it, thread, hv, true);  // link new_it in current LRU and hashtable, update virtual length and do deflation
+    }
+    
 }
 
 /*@null@*/
@@ -597,7 +1152,7 @@ char *item_cachedump(const unsigned int slabs_clsid, const unsigned int limit, u
     unsigned int id = slabs_clsid;
     id |= COLD_LRU;
 
-    pthread_mutex_lock(&lru_locks[id]);
+    // pthread_mutex_lock(&lru_locks[id]);
     it = heads[id];
 
     buffer = malloc((size_t)memlimit);
@@ -631,7 +1186,7 @@ char *item_cachedump(const unsigned int slabs_clsid, const unsigned int limit, u
     bufcurr += 5;
 
     *bytes = bufcurr;
-    pthread_mutex_unlock(&lru_locks[id]);
+    // pthread_mutex_unlock(&lru_locks[id]);
     return buffer;
 }
 
@@ -645,20 +1200,21 @@ void fill_item_stats_automove(item_stats_automove *am) {
 
         // outofmemory records into HOT
         int i = n | HOT_LRU;
-        pthread_mutex_lock(&lru_locks[i]);
+        // pthread_mutex_lock(&lru_locks[i]);
         cur->outofmemory = itemstats[i].outofmemory;
-        pthread_mutex_unlock(&lru_locks[i]);
+        // pthread_mutex_unlock(&lru_locks[i]);
 
         // evictions and tail age are from COLD
         i = n | COLD_LRU;
-        pthread_mutex_lock(&lru_locks[i]);
+        // pthread_mutex_lock(&lru_locks[i]);
         cur->evicted = itemstats[i].evicted;
-        if (tails[i]) {
-            cur->age = current_time - tails[i]->time;
-        } else {
-            cur->age = 0;
-        }
-        pthread_mutex_unlock(&lru_locks[i]);
+        // if (tails[i]) {
+        //     cur->age = current_time - tails[i]->time;
+        // } else {
+        //     cur->age = 0;
+        // }
+        cur->age = 0;
+        // pthread_mutex_unlock(&lru_locks[i]);
      }
 }
 
@@ -671,7 +1227,7 @@ void item_stats_totals(ADD_STAT add_stats, void *c) {
         int i;
         for (x = 0; x < 4; x++) {
             i = n | lru_type_map[x];
-            pthread_mutex_lock(&lru_locks[i]);
+            // pthread_mutex_lock(&lru_locks[i]);
             totals.expired_unfetched += itemstats[i].expired_unfetched;
             totals.evicted_unfetched += itemstats[i].evicted_unfetched;
             totals.evicted_active += itemstats[i].evicted_active;
@@ -684,7 +1240,7 @@ void item_stats_totals(ADD_STAT add_stats, void *c) {
             totals.moves_to_warm += itemstats[i].moves_to_warm;
             totals.moves_within_lru += itemstats[i].moves_within_lru;
             totals.direct_reclaims += itemstats[i].direct_reclaims;
-            pthread_mutex_unlock(&lru_locks[i]);
+            // pthread_mutex_unlock(&lru_locks[i]);
         }
     }
     APPEND_STAT("expired_unfetched", "%llu",
@@ -739,7 +1295,7 @@ void item_stats(ADD_STAT add_stats, void *c) {
         int klen = 0, vlen = 0;
         for (x = 0; x < 4; x++) {
             i = n | lru_type_map[x];
-            pthread_mutex_lock(&lru_locks[i]);
+            // pthread_mutex_lock(&lru_locks[i]);
             totals.evicted += itemstats[i].evicted;
             totals.evicted_nonzero += itemstats[i].evicted_nonzero;
             totals.outofmemory += itemstats[i].outofmemory;
@@ -780,7 +1336,7 @@ void item_stats(ADD_STAT add_stats, void *c) {
                     totals.hits_to_temp = thread_stats.lru_hits[i];
                     break;
             }
-            pthread_mutex_unlock(&lru_locks[i]);
+            // pthread_mutex_unlock(&lru_locks[i]);
         }
         if (size == 0)
             continue;
@@ -944,8 +1500,13 @@ void item_stats_sizes(ADD_STAT add_stats, void *c) {
 }
 
 /** wrapper around assoc_find which does the lazy expiration logic */
+// item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c, const bool do_update) {
 item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c, const bool do_update) {
     item *it = assoc_find(key, nkey, hv);
+
+    LIBEVENT_THREAD *thread = c->thread;   /* current thread */
+    int thread_id = thread->id;
+
     if (it != NULL) {
         refcount_incr(it);
         /* Optimization for slab reassignment. prevents popular items from
@@ -985,10 +1546,11 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c
 
     if (it != NULL) {
         was_found = 1;
-        if (item_is_flushed(it)) {
-            do_item_unlink(it, hv);
+        if (item_is_flushed(it)) {   /* item is flushed */
+            // do_item_unlink(it, thread_id, hv);
+            do_item_unlink_inall(it, hv);
             STORAGE_delete(c->thread->storage, it);
-            do_item_remove(it);
+            // do_item_remove(it);   /* it is removed in unlink_inall */
             it = NULL;
             pthread_mutex_lock(&c->thread->stats.mutex);
             c->thread->stats.get_flushed++;
@@ -997,10 +1559,11 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c
                 fprintf(stderr, " -nuked by flush");
             }
             was_found = 2;
-        } else if (it->exptime != 0 && it->exptime <= current_time) {
-            do_item_unlink(it, hv);
+        } else if (it->exptime != 0 && it->exptime <= current_time) {  /* item is expired */
+            // do_item_unlink(it, thread_id, hv);
+            do_item_unlink_inall(it, hv);
             STORAGE_delete(c->thread->storage, it);
-            do_item_remove(it);
+            // do_item_remove(it);
             it = NULL;
             pthread_mutex_lock(&c->thread->stats.mutex);
             c->thread->stats.get_expired++;
@@ -1011,29 +1574,50 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c
             was_found = 3;
         } else {
             if (do_update) {
+                bool new = !LRU_item(it, thread_id); // if key-value pair exists, check whether this item is in current thread
                 /* We update the hit markers only during fetches.
                  * An item needs to be hit twice overall to be considered
                  * ACTIVE, but only needs a single hit to maintain activity
                  * afterward.
                  * FETCHED tells if an item has ever been active.
                  */
-                if (settings.lru_segmented) {
-                    if ((it->it_flags & ITEM_ACTIVE) == 0) {
-                        if ((it->it_flags & ITEM_FETCHED) == 0) {
-                            it->it_flags |= ITEM_FETCHED;
-                        } else {
-                            it->it_flags |= ITEM_ACTIVE;
-                            if (ITEM_lruid(it) != COLD_LRU) {
-                                do_item_update(it); // bump LA time
-                            } else if (!lru_bump_async(c->thread->lru_bump_buf, it, hv)) {
-                                // add flag before async bump to avoid race.
-                                it->it_flags &= ~ITEM_ACTIVE;
-                            }
-                        }
+                if (new){ // LRU miss but cache hit: item it is new to current thread
+                    if (settings.lru_segmented){
+                        it->lru[thread_id] = HOT_LRU;
                     }
-                } else {
-                    it->it_flags |= ITEM_FETCHED;
-                    do_item_update(it);
+                    item_link_LRU(it, thread_id);    // link this item to current LRU only, since it's already in hashtable
+                    //deflation
+                    struct counting * result = check_item(it);
+                    deflation(it, thread, result);
+                    if (settings.lru_segmented){
+                        check_S_LRU(HOT_LRU, thread);
+                    }
+                }else{  // LRU hit: item is already in current thread
+                    FILE* fd = fopen("hits.txt", "a");
+                    fprintf(fd, "%s,%d\n", key, thread_id);
+                    fclose(fd);
+                    if (settings.lru_segmented) {
+                        if ((it->it_flag[thread_id] & ITEM_ACTIVE) == 0) {  // item is inactive
+                            if ((it->it_flag[thread_id] & ITEM_FETCHED) == 0) {  // hit once
+                                it->it_flag[thread_id] |= ITEM_FETCHED;  // sitll inactive
+                            } else {
+                                it->it_flag[thread_id] |= ITEM_ACTIVE;   // hit twice, set it active
+                                // if (ITEM_lruid(it) != COLD_LRU) {
+                                // if (it->lru[thread->id] != COLD_LRU) {
+                                //     do_item_update(it, thread_id); // bump LA time
+                                // } else if (!lru_bump_async(c->thread->lru_bump_buf, it, hv)) {
+                                //     // add flag before async bump to avoid race.
+                                //     it->it_flag[thread_id] &= ~ITEM_ACTIVE;
+                                // }
+                                do_item_update(it, thread);  
+                            }
+                        } else { // item is active, bump it if it's in warm
+                            do_item_update(it, thread);
+                        }
+                    }else {
+                        it->it_flag[thread_id] |= ITEM_FETCHED;
+                        do_item_update(it, thread);
+                    }
                 }
             }
             DEBUG_REFCNT(it, '+');
@@ -1043,8 +1627,10 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c
     if (settings.verbose > 2)
         fprintf(stderr, "\n");
     /* For now this is in addition to the above verbose logging. */
+    // LOGGER_LOG(c->thread->l, LOG_FETCHERS, LOGGER_ITEM_GET, NULL, was_found, key, nkey,
+    //            (it) ? ITEM_clsid(it) : 0);
     LOGGER_LOG(c->thread->l, LOG_FETCHERS, LOGGER_ITEM_GET, NULL, was_found, key, nkey,
-               (it) ? ITEM_clsid(it) : 0);
+               (it) ? it->slabs_clsid : 0);
 
     return it;
 }
@@ -1060,15 +1646,34 @@ item *do_item_touch(const char *key, size_t nkey, uint32_t exptime,
 
 /*** LRU MAINTENANCE THREAD ***/
 
+void slab_pull_tail(int clsid){
+    slabclass_t *p = get_slab(clsid);
+    uint32_t hv;
+    if(p->alloc_tail){
+        item *it = (item *)p->alloc_tail;
+        hv = hash(ITEM_key(it), it->nkey);
+        do_item_unlink_inall(it, hv);   // unlink item in all LRUs, remove from hashtable, reclaim memory in slab (unlink in alloclist, link to freelist)
+        //printf("there are %d free items in current slab.\n", (int)p->sl_curr);    
+    }else{
+        //printf("slabclass %d is empty!\n", clsid);
+    }
+}
+
 /* Returns number of items remove, expired, or evicted.
  * Callable from worker threads or the LRU maintainer thread */
-int lru_pull_tail(const int orig_id, const int cur_lru,
+// int lru_pull_tail(const int orig_id, const int cur_lru,
+//         const uint64_t total_bytes, const uint8_t flags, const rel_time_t max_age,
+//         struct lru_pull_tail_return *ret_it) {
+int lru_pull_tail(LIBEVENT_THREAD *thread, const int orig_id, const int cur_lru,
         const uint64_t total_bytes, const uint8_t flags, const rel_time_t max_age,
         struct lru_pull_tail_return *ret_it) {
     item *it = NULL;
-    int id = orig_id;
+    // int id = orig_id;
+    // int id;
     int removed = 0;
-    if (id == 0)
+    // if (id == 0)
+    //     return 0;
+     if (thread == NULL)
         return 0;
 
     int tries = 5;
@@ -1078,17 +1683,22 @@ int lru_pull_tail(const int orig_id, const int cur_lru,
     unsigned int move_to_lru = 0;
     uint64_t limit = 0;
 
-    id |= cur_lru;
-    pthread_mutex_lock(&lru_locks[id]);
-    search = tails[id];
+    // id |= cur_lru;
+    int thread_id = thread->id;
+    int LRU_id = thread_id * NUM_SUB_LRU_LISTS + cur_lru;
+    
+    // pthread_mutex_lock(&lru_locks[id]);
+    // search = tails[id];
+    search = tails[LRU_id];
     /* We walk up *only* for locked items, and if bottom is expired. */
     for (; tries > 0 && search != NULL; tries--, search=next_it) {
         /* we might relink search mid-loop, so search->prev isn't reliable */
-        next_it = search->prev;
-        if (search->nbytes == 0 && search->nkey == 0 && search->it_flags == 1) {
+        // next_it = search->prev;
+        next_it = search->prevs[thread_id];
+        if (search->nbytes == 0 && search->nkey == 0 && search->it_flag[thread->id] == 1) {
             /* We are a crawler, ignore it. */
             if (flags & LRU_PULL_CRAWL_BLOCKS) {
-                pthread_mutex_unlock(&lru_locks[id]);
+                // pthread_mutex_unlock(&lru_locks[id]);
                 return 0;
             }
             tries++;
@@ -1103,16 +1713,17 @@ int lru_pull_tail(const int orig_id, const int cur_lru,
         if (refcount_incr(search) != 2) {
             /* Note pathological case with ref'ed items in tail.
              * Can still unlink the item, but it won't be reusable yet */
-            itemstats[id].lrutail_reflocked++;
+            itemstats[LRU_id].lrutail_reflocked++;
             /* In case of refcount leaks, enable for quick workaround. */
             /* WARNING: This can cause terrible corruption */
             if (settings.tail_repair_time &&
                     search->time + settings.tail_repair_time < current_time) {
-                itemstats[id].tailrepairs++;
+                itemstats[LRU_id].tailrepairs++;
                 search->refcount = 1;
                 /* This will call item_remove -> item_free since refcnt is 1 */
                 STORAGE_delete(ext_storage, search);
-                do_item_unlink_nolock(search, hv);
+                // do_item_unlink_nolock(search, thread_id, hv);
+                do_item_unlink_inall(search, hv);
                 item_trylock_unlock(hold_lock);
                 continue;
             }
@@ -1121,12 +1732,13 @@ int lru_pull_tail(const int orig_id, const int cur_lru,
         /* Expired or flushed */
         if ((search->exptime != 0 && search->exptime < current_time)
             || item_is_flushed(search)) {
-            itemstats[id].reclaimed++;
-            if ((search->it_flags & ITEM_FETCHED) == 0) {
-                itemstats[id].expired_unfetched++;
+            itemstats[LRU_id].reclaimed++;
+            if ((search->it_flag[thread->id] & ITEM_FETCHED) == 0) {
+                itemstats[LRU_id].expired_unfetched++;
             }
             /* refcnt 2 -> 1 */
-            do_item_unlink_nolock(search, hv);
+            // do_item_unlink_nolock(search, thread_id, hv);
+            do_item_unlink_inall(search, hv);
             STORAGE_delete(ext_storage, search);
             /* refcnt 1 -> 0 -> item_free */
             do_item_remove(search);
@@ -1147,26 +1759,26 @@ int lru_pull_tail(const int orig_id, const int cur_lru,
                 if (limit == 0)
                     limit = total_bytes * settings.warm_lru_pct / 100;
                 /* Rescue ACTIVE items aggressively */
-                if ((search->it_flags & ITEM_ACTIVE) != 0) {
-                    search->it_flags &= ~ITEM_ACTIVE;
+                if ((search->it_flag[thread->id] & ITEM_ACTIVE) != 0) {
+                    search->it_flag[thread->id] &= ~ITEM_ACTIVE;
                     removed++;
                     if (cur_lru == WARM_LRU) {
-                        itemstats[id].moves_within_lru++;
-                        do_item_update_nolock(search);
-                        do_item_remove(search);
+                        itemstats[LRU_id].moves_within_lru++;
+                        do_item_update_nolock(search, thread_id);
+                        // do_item_remove(search);
                         item_trylock_unlock(hold_lock);
                     } else {
                         /* Active HOT_LRU items flow to WARM */
-                        itemstats[id].moves_to_warm++;
+                        itemstats[LRU_id].moves_to_warm++;
                         move_to_lru = WARM_LRU;
-                        do_item_unlink_q(search);
+                        do_item_unlink_q(search, thread_id);
                         it = search;
                     }
-                } else if (sizes_bytes[id] > limit ||
+                } else if (sizes_bytes[LRU_id] > limit ||
                            current_time - search->time > max_age) {
-                    itemstats[id].moves_to_cold++;
+                    itemstats[LRU_id].moves_to_cold++;
                     move_to_lru = COLD_LRU;
-                    do_item_unlink_q(search);
+                    do_item_unlink_q(search, thread_id);
                     it = search;
                     removed++;
                     break;
@@ -1182,19 +1794,20 @@ int lru_pull_tail(const int orig_id, const int cur_lru,
                         /* Don't think we need a counter for this. It'll OOM.  */
                         break;
                     }
-                    itemstats[id].evicted++;
-                    itemstats[id].evicted_time = current_time - search->time;
+                    itemstats[LRU_id].evicted++;
+                    itemstats[LRU_id].evicted_time = current_time - search->time;
                     if (search->exptime != 0)
-                        itemstats[id].evicted_nonzero++;
-                    if ((search->it_flags & ITEM_FETCHED) == 0) {
-                        itemstats[id].evicted_unfetched++;
+                        itemstats[LRU_id].evicted_nonzero++;
+                    if ((search->it_flag[thread->id] & ITEM_FETCHED) == 0) {
+                        itemstats[LRU_id].evicted_unfetched++;
                     }
-                    if ((search->it_flags & ITEM_ACTIVE)) {
-                        itemstats[id].evicted_active++;
+                    if ((search->it_flag[thread->id] & ITEM_ACTIVE)) {
+                        itemstats[LRU_id].evicted_active++;
                     }
                     LOGGER_LOG(NULL, LOG_EVICTIONS, LOGGER_EVICTION, search);
                     STORAGE_delete(ext_storage, search);
-                    do_item_unlink_nolock(search, hv);
+                    // do_item_unlink_nolock(search, thread_id, hv);
+                    do_item_unlink_inall(search, hv);
                     removed++;
                     if (settings.slab_automove == 2) {
                         slabs_reassign(-1, orig_id);
@@ -1203,12 +1816,12 @@ int lru_pull_tail(const int orig_id, const int cur_lru,
                     /* Keep a reference to this item and return it. */
                     ret_it->it = it;
                     ret_it->hv = hv;
-                } else if ((search->it_flags & ITEM_ACTIVE) != 0
+                } else if ((search->it_flag[thread->id] & ITEM_ACTIVE) != 0
                         && settings.lru_segmented) {
-                    itemstats[id].moves_to_warm++;
-                    search->it_flags &= ~ITEM_ACTIVE;
+                    itemstats[LRU_id].moves_to_warm++;
+                    search->it_flag[thread->id] &= ~ITEM_ACTIVE;
                     move_to_lru = WARM_LRU;
-                    do_item_unlink_q(search);
+                    do_item_unlink_q(search, thread_id);
                     removed++;
                 }
                 break;
@@ -1220,13 +1833,14 @@ int lru_pull_tail(const int orig_id, const int cur_lru,
             break;
     }
 
-    pthread_mutex_unlock(&lru_locks[id]);
+    // pthread_mutex_unlock(&lru_locks[id]);
 
     if (it != NULL) {
         if (move_to_lru) {
-            it->slabs_clsid = ITEM_clsid(it);
-            it->slabs_clsid |= move_to_lru;
-            item_link_q(it);
+            // it->slabs_clsid = ITEM_clsid(it);
+            // it->slabs_clsid |= move_to_lru;
+            it->lru[thread_id] = move_to_lru;
+            item_link_q(it,thread_id);
         }
         if ((flags & LRU_PULL_RETURN_ITEM) == 0) {
             do_item_remove(it);
@@ -1270,28 +1884,29 @@ void *item_lru_bump_buf_create(void) {
     return b;
 }
 
-static bool lru_bump_async(lru_bump_buf *b, item *it, uint32_t hv) {
-    bool ret = true;
-    refcount_incr(it);
-    pthread_mutex_lock(&b->mutex);
-    lru_bump_entry *be = (lru_bump_entry *) bipbuf_request(b->buf, sizeof(lru_bump_entry));
-    if (be != NULL) {
-        be->it = it;
-        be->hv = hv;
-        if (bipbuf_push(b->buf, sizeof(lru_bump_entry)) == 0) {
-            ret = false;
-            b->dropped++;
-        }
-    } else {
-        ret = false;
-        b->dropped++;
-    }
-    if (!ret) {
-        refcount_decr(it);
-    }
-    pthread_mutex_unlock(&b->mutex);
-    return ret;
-}
+// NOT used in our expriment
+// static bool lru_bump_async(lru_bump_buf *b, item *it, uint32_t hv) {
+//     bool ret = true;
+//     refcount_incr(it);
+//     pthread_mutex_lock(&b->mutex);
+//     lru_bump_entry *be = (lru_bump_entry *) bipbuf_request(b->buf, sizeof(lru_bump_entry));
+//     if (be != NULL) {
+//         be->it = it;
+//         be->hv = hv;
+//         if (bipbuf_push(b->buf, sizeof(lru_bump_entry)) == 0) {
+//             ret = false;
+//             b->dropped++;
+//         }
+//     } else {
+//         ret = false;
+//         b->dropped++;
+//     }
+//     if (!ret) {
+//         refcount_decr(it);
+//     }
+//     pthread_mutex_unlock(&b->mutex);
+//     return ret;
+// }
 
 /* TODO: Might be worth a micro-optimization of having bump buffers link
  * themselves back into the central queue when queue goes from zero to
@@ -1319,7 +1934,7 @@ static bool lru_maintainer_bumps(void) {
 
         while (todo) {
             item_lock(be->hv);
-            do_item_update(be->it);
+            // do_item_update(be->it);
             do_item_remove(be->it);
             item_unlock(be->hv);
             be++;
@@ -1367,11 +1982,11 @@ static int lru_maintainer_juggle(const int slabs_clsid) {
     if (settings.temp_lru) {
         /* Only looking for reclaims. Run before we size the LRU. */
         for (i = 0; i < 500; i++) {
-            if (lru_pull_tail(slabs_clsid, TEMP_LRU, 0, 0, 0, NULL) <= 0) {
-                break;
-            } else {
-                did_moves++;
-            }
+            // if (lru_pull_tail(slabs_clsid, TEMP_LRU, 0, 0, 0, NULL) <= 0) {
+            //     break;
+            // } else {
+            //     did_moves++;
+            // }
         }
         total_bytes -= temp_lru_size(slabs_clsid);
     }
@@ -1381,11 +1996,11 @@ static int lru_maintainer_juggle(const int slabs_clsid) {
     rel_time_t warm_age = 0;
     /* If LRU is in flat mode, force items to drain into COLD via max age */
     if (settings.lru_segmented) {
-        pthread_mutex_lock(&lru_locks[slabs_clsid|COLD_LRU]);
+        // pthread_mutex_lock(&lru_locks[slabs_clsid|COLD_LRU]);
         if (tails[slabs_clsid|COLD_LRU]) {
             cold_age = current_time - tails[slabs_clsid|COLD_LRU]->time;
         }
-        pthread_mutex_unlock(&lru_locks[slabs_clsid|COLD_LRU]);
+        // pthread_mutex_unlock(&lru_locks[slabs_clsid|COLD_LRU]);
         hot_age = cold_age * settings.hot_max_factor;
         warm_age = cold_age * settings.warm_max_factor;
     }
@@ -1393,13 +2008,13 @@ static int lru_maintainer_juggle(const int slabs_clsid) {
     /* Juggle HOT/WARM up to N times */
     for (i = 0; i < 500; i++) {
         int do_more = 0;
-        if (lru_pull_tail(slabs_clsid, HOT_LRU, total_bytes, LRU_PULL_CRAWL_BLOCKS, hot_age, NULL) ||
-            lru_pull_tail(slabs_clsid, WARM_LRU, total_bytes, LRU_PULL_CRAWL_BLOCKS, warm_age, NULL)) {
-            do_more++;
-        }
-        if (settings.lru_segmented) {
-            do_more += lru_pull_tail(slabs_clsid, COLD_LRU, total_bytes, LRU_PULL_CRAWL_BLOCKS, 0, NULL);
-        }
+        // if (lru_pull_tail(slabs_clsid, HOT_LRU, total_bytes, LRU_PULL_CRAWL_BLOCKS, hot_age, NULL) ||
+        //     lru_pull_tail(slabs_clsid, WARM_LRU, total_bytes, LRU_PULL_CRAWL_BLOCKS, warm_age, NULL)) {
+        //     do_more++;
+        // }
+        // if (settings.lru_segmented) {
+        //     do_more += lru_pull_tail(slabs_clsid, COLD_LRU, total_bytes, LRU_PULL_CRAWL_BLOCKS, 0, NULL);
+        // }
         if (do_more == 0)
             break;
         did_moves++;
@@ -1497,11 +2112,11 @@ static void lru_maintainer_crawler_check(struct crawler_expired_data *cdata, log
             pthread_mutex_unlock(&cdata->lock);
         }
         if (current_time > next_crawls[i]) {
-            pthread_mutex_lock(&lru_locks[i]);
+            // pthread_mutex_lock(&lru_locks[i]);
             if (sizes[i] > tocrawl_limit) {
                 tocrawl_limit = sizes[i];
             }
-            pthread_mutex_unlock(&lru_locks[i]);
+            // pthread_mutex_unlock(&lru_locks[i]);
             todo[i] = 1;
             do_run = true;
             next_crawls[i] = current_time + 5; // minimum retry wait.
@@ -1705,7 +2320,7 @@ int init_lru_maintainer(void) {
 /* Tail linkers and crawler for the LRU crawler. */
 void do_item_linktail_q(item *it) { /* item is the new tail */
     item **head, **tail;
-    assert(it->it_flags == 1);
+    // assert(it->it_flags == 1);
     assert(it->nbytes == 0);
 
     head = &heads[it->slabs_clsid];
@@ -1749,7 +2364,7 @@ void do_item_unlinktail_q(item *it) {
  * more clearly. */
 item *do_item_crawl_q(item *it) {
     item **head, **tail;
-    assert(it->it_flags == 1);
+    // assert(it->it_flags == 1);
     assert(it->nbytes == 0);
     head = &heads[it->slabs_clsid];
     tail = &tails[it->slabs_clsid];
