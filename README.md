@@ -34,4 +34,4 @@ https://github.com/memcached/memcached.git
 ## Refrences
 
 * https://www.memcached.org
-* Technical Report in the repository (main2-TR.pdf)
+* https://arxiv.org/pdf/1905.07641.pdf
